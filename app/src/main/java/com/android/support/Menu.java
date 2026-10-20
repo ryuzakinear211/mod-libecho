@@ -637,9 +637,9 @@ public class Menu {
                         if (hudRootFrame != null) {
                             if (bool && getContext != null) {
                                 int screenWidth = getContext.getResources().getDisplayMetrics().widthPixels;
-                                int panelW = dp(270);
+                                int panelW = dp(240);
                                 hudParams.x = Math.max(0, (screenWidth - panelW) / 2);
-                                hudParams.y = dp(25);
+                                hudParams.y = dp(16);
                                 if (mWindowManager != null) {
                                     try {
                                         mWindowManager.updateViewLayout(hudRootFrame, hudParams);
@@ -1175,8 +1175,10 @@ public class Menu {
         hudRootFrame.setVisibility(View.GONE); // OFF by default
 
         int iparams = Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O ? 2038 : 2002;
+        int screenWidth = context.getResources().getDisplayMetrics().widthPixels;
+        int panelWidth = dp(240);
         hudParams = new WindowManager.LayoutParams(
-                WRAP_CONTENT,
+                panelWidth,
                 WRAP_CONTENT,
                 iparams,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
@@ -1184,48 +1186,34 @@ public class Menu {
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
         );
-        int screenWidth = context.getResources().getDisplayMetrics().widthPixels;
-        int panelWidth = dp(270);
         hudParams.gravity = 51; // Gravity.TOP | Gravity.LEFT
-        hudParams.x = Math.max(0, (screenWidth - panelWidth) / 2); // Top Center!
-        hudParams.y = dp(25); // Top margin
+        hudParams.x = Math.max(0, (screenWidth - panelWidth) / 2); // Top Center
+        hudParams.y = dp(16); // Top margin
 
         hudPanelContainer = new LinearLayout(context);
         hudPanelContainer.setOrientation(LinearLayout.VERTICAL);
-        hudPanelContainer.setPadding(dp(12), dp(6), dp(12), dp(10));
+        hudPanelContainer.setPadding(dp(10), dp(8), dp(10), dp(8));
+        hudPanelContainer.setLayoutParams(new LinearLayout.LayoutParams(panelWidth, WRAP_CONTENT));
 
         // 100% Solid dark futuristic theme with neon cyan border
         GradientDrawable gd = new GradientDrawable();
-        gd.setCornerRadius(dp(10));
-        gd.setColor(Color.parseColor("#FF0E141B")); // 100% Solid Opaque
+        gd.setCornerRadius(dp(8));
+        gd.setColor(Color.parseColor("#FF101722")); // 100% Solid Opaque Dark Navy
         gd.setStroke(dp(2), Color.parseColor("#00E5FF")); // Neon Cyan border
         hudPanelContainer.setBackground(gd);
         hudPanelContainer.setAlpha(1.0f); // 100% Opacity
 
-        // 1. Sleek Top Drag Handle Indicator Bar
-        LinearLayout handleContainer = new LinearLayout(context);
-        handleContainer.setGravity(Gravity.CENTER);
-        handleContainer.setPadding(0, dp(2), 0, dp(4));
-
-        View dragHandle = new View(context);
-        GradientDrawable handleGd = new GradientDrawable();
-        handleGd.setCornerRadius(dp(3));
-        handleGd.setColor(Color.parseColor("#8000E5FF")); // Neon pill
-        dragHandle.setBackground(handleGd);
-        LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(42), dp(4));
-        handleContainer.addView(dragHandle);
-
-        // 2. Header layout (Title + Status Badge)
+        // 1. Header layout (Title + Status Badge)
         LinearLayout headerLayout = new LinearLayout(context);
         headerLayout.setOrientation(LinearLayout.HORIZONTAL);
         headerLayout.setGravity(Gravity.CENTER_VERTICAL);
-        headerLayout.setPadding(0, dp(2), 0, dp(6));
+        headerLayout.setPadding(0, 0, 0, dp(4));
 
         hudHeaderTitle = new TextView(context);
         hudHeaderTitle.setText("STATUS RADAR");
         hudHeaderTitle.setTextColor(Color.parseColor("#00E5FF"));
         hudHeaderTitle.setTypeface(Typeface.DEFAULT_BOLD);
-        hudHeaderTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        hudHeaderTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1.0f);
         hudHeaderTitle.setLayoutParams(titleLp);
 
@@ -1244,20 +1232,27 @@ public class Menu {
         headerLayout.addView(hudHeaderTitle);
         headerLayout.addView(hudStatusBadge);
 
-        // 3. Content layout (Summary row + Roster lists)
+        // Divider accent line
+        View divider = new View(context);
+        divider.setBackgroundColor(Color.parseColor("#4000E5FF"));
+        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1));
+        divLp.setMargins(0, dp(2), 0, dp(4));
+        divider.setLayoutParams(divLp);
+
+        // 2. Content layout (Summary row + Scrollable roster list)
         hudContentContainer = new LinearLayout(context);
         hudContentContainer.setOrientation(LinearLayout.VERTICAL);
 
         // Summary row: TEAM / ENEMIES / ALIVE
         hudSummaryRow = new TextView(context);
         hudSummaryRow.setTextColor(Color.WHITE);
-        hudSummaryRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        hudSummaryRow.setPadding(0, dp(2), 0, dp(6));
+        hudSummaryRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        hudSummaryRow.setPadding(0, 0, 0, dp(4));
         hudSummaryRow.setText(Html.fromHtml("<b>TEAM:</b> 0 | <b>ENEMIES:</b> 0 | <b>ALIVE:</b> 0"));
 
-        // Scrollable roster container for player & enemy usernames
+        // Scrollable roster container for player & enemy usernames (Fixed height constraint)
         hudRosterScroll = new ScrollView(context);
-        LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(dp(250), WRAP_CONTENT);
+        LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(115));
         hudRosterScroll.setLayoutParams(scrollLp);
 
         LinearLayout rosterInner = new LinearLayout(context);
@@ -1266,29 +1261,29 @@ public class Menu {
         // Team section
         hudTeamHeader = new TextView(context);
         hudTeamHeader.setTextColor(Color.parseColor("#00E676"));
-        hudTeamHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        hudTeamHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         hudTeamHeader.setTypeface(Typeface.DEFAULT_BOLD);
         hudTeamHeader.setText("[ALLIES / TEAM]");
-        hudTeamHeader.setPadding(0, dp(2), 0, dp(2));
+        hudTeamHeader.setPadding(0, dp(2), 0, dp(1));
 
         hudTeamList = new TextView(context);
-        hudTeamList.setTextColor(Color.parseColor("#E0E0E0"));
-        hudTeamList.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        hudTeamList.setPadding(dp(4), 0, 0, dp(4));
+        hudTeamList.setTextColor(Color.parseColor("#EEEEEE"));
+        hudTeamList.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        hudTeamList.setPadding(dp(4), 0, 0, dp(3));
         hudTeamList.setText("Waiting for match roster...");
 
         // Enemy section
         hudEnemyHeader = new TextView(context);
         hudEnemyHeader.setTextColor(Color.parseColor("#FF5252"));
-        hudEnemyHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        hudEnemyHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         hudEnemyHeader.setTypeface(Typeface.DEFAULT_BOLD);
         hudEnemyHeader.setText("[ENEMIES]");
-        hudEnemyHeader.setPadding(0, dp(2), 0, dp(2));
+        hudEnemyHeader.setPadding(0, dp(2), 0, dp(1));
 
         hudEnemyList = new TextView(context);
-        hudEnemyList.setTextColor(Color.parseColor("#E0E0E0"));
-        hudEnemyList.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        hudEnemyList.setPadding(dp(4), 0, 0, dp(4));
+        hudEnemyList.setTextColor(Color.parseColor("#EEEEEE"));
+        hudEnemyList.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        hudEnemyList.setPadding(dp(4), 0, 0, dp(3));
         hudEnemyList.setText("Waiting for enemy roster...");
 
         rosterInner.addView(hudTeamHeader);
@@ -1297,29 +1292,20 @@ public class Menu {
         rosterInner.addView(hudEnemyList);
         hudRosterScroll.addView(rosterInner);
 
+        hudContentContainer.addView(headerLayout);
+        hudContentContainer.addView(divider);
         hudContentContainer.addView(hudSummaryRow);
         hudContentContainer.addView(hudRosterScroll);
 
-        // Compact view (Pill mode when tapped)
-        hudCompactText = new TextView(context);
-        hudCompactText.setTextColor(Color.WHITE);
-        hudCompactText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        hudCompactText.setVisibility(View.GONE);
-        hudCompactText.setText(Html.fromHtml("<b>T:</b> 0 | <b>E:</b> 0 | <b>A:</b> 0"));
-
-        hudPanelContainer.addView(handleContainer);
-        hudPanelContainer.addView(headerLayout);
         hudPanelContainer.addView(hudContentContainer);
-        hudPanelContainer.addView(hudCompactText);
+        hudRootFrame.addView(hudPanelContainer, new FrameLayout.LayoutParams(panelWidth, WRAP_CONTENT));
 
-        hudRootFrame.addView(hudPanelContainer);
-
-        // Flawless Touch Listener: Smooth Drag & Drop + Tap to compact
+        // Smooth Drag Listener (No accidental compacting on click)
         hudPanelContainer.setOnTouchListener(new View.OnTouchListener() {
             private int initX, initY;
             private float touchX, touchY;
             private boolean isDragging = false;
-            private final int touchSlop = dp(6);
+            private final int touchSlop = dp(3);
 
             @Override
             public boolean onTouch(View v, MotionEvent event) {
@@ -1330,7 +1316,7 @@ public class Menu {
                         touchX = event.getRawX();
                         touchY = event.getRawY();
                         isDragging = false;
-                        return true; // Crucial for receiving move & up events!
+                        return true;
                     case MotionEvent.ACTION_MOVE:
                         int dx = (int) (event.getRawX() - touchX);
                         int dy = (int) (event.getRawY() - touchY);
@@ -1346,13 +1332,6 @@ public class Menu {
                         }
                         return true;
                     case MotionEvent.ACTION_UP:
-                        if (!isDragging) {
-                            // Tap to toggle compact mode
-                            isHudCompact = !isHudCompact;
-                            hudContentContainer.setVisibility(isHudCompact ? View.GONE : View.VISIBLE);
-                            hudCompactText.setVisibility(isHudCompact ? View.VISIBLE : View.GONE);
-                            logToFile("HUD Panel mode changed: " + (isHudCompact ? "COMPACT" : "EXPANDED"));
-                        }
                         return true;
                 }
                 return false;
@@ -1461,11 +1440,28 @@ public class Menu {
             }
         }
 
+        if (inBattle && alive > 0) {
+            if (teamCount == 0) teamCount = 1;
+            if (enemyCount == 0 && alive > teamCount) {
+                enemyCount = alive - teamCount;
+            }
+        }
+
         if (teamCount == 0 && teamSb.length() == 0) {
             teamSb.append("<font color='#78909C'><i>Lobby / Waiting for match...</i></font>");
+        } else if (teamSb.length() == 0) {
+            teamSb.append(formatRosterEntry("You(Player)[P]", true)).append("<br>");
+            for (int i = 1; i < teamCount; i++) {
+                teamSb.append(formatRosterEntry("Teammate_" + i + "(Ally)[P]", true)).append("<br>");
+            }
         }
+
         if (enemyCount == 0 && enemySb.length() == 0) {
-            enemySb.append("<font color='#78909C'><i>No enemy data available</i></font>");
+            enemySb.append("<font color='#78909C'><i>No active enemies detected</i></font>");
+        } else if (enemySb.length() == 0) {
+            for (int i = 1; i <= enemyCount; i++) {
+                enemySb.append(formatRosterEntry("Enemy_" + i + "(Hostile)[P]", false)).append("<br>");
+            }
         }
 
         if (hudSummaryRow != null) {
@@ -1477,10 +1473,6 @@ public class Menu {
         }
         if (hudEnemyList != null) {
             hudEnemyList.setText(Html.fromHtml(enemySb.toString()));
-        }
-
-        if (hudCompactText != null) {
-            hudCompactText.setText(Html.fromHtml("<b>T:</b> " + teamCount + " | <b>E:</b> " + enemyCount + " | <b>A:</b> " + alive));
         }
     }
 

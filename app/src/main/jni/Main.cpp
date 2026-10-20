@@ -34,8 +34,10 @@ static std::atomic<bool> g_FullBright{false};
 
 static bool g_HudStatusPanelEnabled = false; // OFF by default
 
-// Captured MatchData pointer from player lookup
+// Captured pointers from in-game presenters
 static void* g_MatchData = nullptr;
+static void* g_AliveUnitsCounterInstance = nullptr;
+static std::atomic<int> g_TeamCount{1};
 
 // ============================================================================
 // Target offsets resolved from dump.txt & binary analysis:
@@ -44,18 +46,18 @@ static void* g_MatchData = nullptr;
 // 3. 0x1f65028: BotSystem bot logic/version registration ("BotSystem.cpp")
 // 4. 0x1c06758: Bot elimination handler ("kill_bots" / "KILL BOTS (Alt+I)")
 // 5. 0x268c4c4: sub_268C4C4(matchData, playerId) - Match player roster lookup
-// 6. 0x2f0a130: sub_2F0A130(instance) - DarknessRTT active check (returns true to disable darkness)
-// 7. 0x114139c: sub_114139C(instance) - Darkness shader pass condition (returns false to skip)
-// 8. 0x2666d8c: sub_2666D8C(cfg, ...) - Character vision & visibility config loader
+// 6. 0x1142af4: sub_1142AF4(instance) - Darkness overlay render pass (lightScreenRTT / lightSectorRTT)
+// 7. 0x11404f8: sub_11404F8(instance) - Darkness setup pass
+// 8. 0x26670ac: sub_26670AC(cfg, ...) - Character vision loader (+0x20 is visionRadius)
 // ============================================================================
-#define OFFSET_ALIVE_UNITS_SETUP   "0x1bcadcc"
-#define OFFSET_PLAYER_DIED_EVENT   "0x1c9e3e0"
-#define OFFSET_BOT_SYSTEM_SPAWN    "0x1f65028"
-#define OFFSET_KILL_BOTS_ACTION    "0x1c06758"
-#define OFFSET_PLAYER_LOOKUP       "0x268c4c4"
-#define OFFSET_DARKNESS_CHECK      "0x2f0a130"
-#define OFFSET_DARKNESS_SHADER     "0x114139c"
-#define OFFSET_VISION_CONFIG       "0x2666d8c"
+#define OFFSET_ALIVE_UNITS_SETUP      "0x1bcadcc"
+#define OFFSET_PLAYER_DIED_EVENT      "0x1c9e3e0"
+#define OFFSET_BOT_SYSTEM_SPAWN       "0x1f65028"
+#define OFFSET_KILL_BOTS_ACTION       "0x1c06758"
+#define OFFSET_PLAYER_LOOKUP          "0x268c4c4"
+#define OFFSET_DARKNESS_RENDER_PASS   "0x1142af4"
+#define OFFSET_DARKNESS_SETUP_PASS    "0x11404f8"
+#define OFFSET_VISION_RADIUS_LOADER   "0x26670ac"
 
 // Original function pointers
 static void *(*orig_alive_units_setup)(void *instance) = nullptr;
@@ -63,9 +65,9 @@ static void  (*orig_player_died_event)(void *instance, void *param1, void *param
 static void *(*orig_bot_system_spawn)(void *instance, void *cfg) = nullptr;
 static void  (*orig_kill_bots_action)(void *instance) = nullptr;
 static void *(*orig_player_lookup)(void *matchData, uint32_t playerId) = nullptr;
-static bool  (*orig_darkness_check)(void *instance) = nullptr;
-static bool  (*orig_darkness_shader)(void *instance) = nullptr;
-static void  (*orig_vision_config)(void *outStruct, void *a2, void *a3, void *a4, void *a5) = nullptr;
+static void  (*orig_darkness_render_pass)(void *instance) = nullptr;
+static void  (*orig_darkness_setup_pass)(void *instance) = nullptr;
+static void  (*orig_vision_radius_loader)(void *outStruct, void *cfg) = nullptr;
 
 // Helper: Safely decode libc++ std::string in ARM64 memory
 static std::string ReadStdString(uintptr_t strPtr) {
@@ -95,15 +97,29 @@ static std::string ReadStdString(uintptr_t strPtr) {
 // Hook 1: alive_units_counter setup
 void *hook_alive_units_setup(void *instance) {
     g_InMatch.store(true);
+    g_AliveUnitsCounterInstance = instance;
     LOGI("[HUD Hook] alive_units_counter setup initialized! View: %p", instance);
+
+    if (instance) {
+        int32_t liveAlive = *(int32_t*)((uintptr_t)instance + 0x60);
+        int32_t liveTeam  = *(int32_t*)((uintptr_t)instance + 0x64);
+        if (liveAlive > 0 && liveAlive < 50) {
+            g_AliveUnits.store(liveAlive);
+        }
+        if (liveTeam > 0 && liveTeam < 20) {
+            g_TeamCount.store(liveTeam);
+        }
+    }
 
     int currentTotal = g_PlayerCount.load() + g_BotCount.load();
     if (currentTotal <= 0) {
-        currentTotal = 10;
-        g_PlayerCount.store(2);
-        g_BotCount.store(8);
+        currentTotal = 12;
+        g_PlayerCount.store(3);
+        g_BotCount.store(9);
     }
-    g_AliveUnits.store(currentTotal);
+    if (g_AliveUnits.load() <= 0) {
+        g_AliveUnits.store(currentTotal);
+    }
 
     if (orig_alive_units_setup) {
         return orig_alive_units_setup(instance);
@@ -114,7 +130,7 @@ void *hook_alive_units_setup(void *instance) {
 // Hook 2: BattleHudPresenterSystem player/bot death announcement
 void hook_player_died_event(void *instance, void *param1, void *param2) {
     int alive = g_AliveUnits.load();
-    if (alive > 0) {
+    if (alive > 1) {
         alive--;
         g_AliveUnits.store(alive);
     }
@@ -159,7 +175,7 @@ void hook_kill_bots_action(void *instance) {
     int bots = g_BotCount.load();
     int alive = g_AliveUnits.load();
     alive -= bots;
-    if (alive < 0) alive = 0;
+    if (alive < 1) alive = 1;
     g_AliveUnits.store(alive);
     g_BotCount.store(0);
 
@@ -180,38 +196,50 @@ void *hook_player_lookup(void *matchData, uint32_t playerId) {
     return nullptr;
 }
 
-// Hook 6: Full Bright - Darkness check bypass (0x2f0a130)
-bool hook_darkness_check(void *instance) {
+// Hook 6: Full Bright - Darkness Render Pass Bypass (0x1142af4)
+void hook_darkness_render_pass(void *instance) {
     if (g_FullBright.load()) {
-        return true; // Bypass DarknessRTT render pass!
+        // Skip drawing the dark quad/overlay completely!
+        return;
     }
-    if (orig_darkness_check) {
-        return orig_darkness_check(instance);
+    if (orig_darkness_render_pass) {
+        orig_darkness_render_pass(instance);
     }
-    return false;
 }
 
-// Hook 7: Full Bright - Darkness shader pass bypass (0x114139c)
-bool hook_darkness_shader(void *instance) {
+// Hook 7: Full Bright - Darkness Setup Pass Bypass (0x11404f8)
+void hook_darkness_setup_pass(void *instance) {
     if (g_FullBright.load()) {
-        return false; // Skip darkness shader pass!
+        return;
     }
-    if (orig_darkness_shader) {
-        return orig_darkness_shader(instance);
+    if (orig_darkness_setup_pass) {
+        orig_darkness_setup_pass(instance);
     }
-    return false;
 }
 
-// Hook 8: Full Bright - Character vision & visibility 360 degree expansion (0x2666d8c)
-void hook_vision_config(void *outStruct, void *a2, void *a3, void *a4, void *a5) {
-    if (orig_vision_config) {
-        orig_vision_config(outStruct, a2, a3, a4, a5);
+// Hook 8: Full Bright - Character Vision Radius 500m Expansion (0x26670ac)
+void hook_vision_radius_loader(void *outStruct, void *cfg) {
+    if (orig_vision_radius_loader) {
+        orig_vision_radius_loader(outStruct, cfg);
     }
     if (g_FullBright.load() && outStruct) {
-        // [outStruct + 0x38] is visibilityRadius (float)
-        // [outStruct + 0x3c] is visibilityAngle (float, in radians)
-        *(float*)((uintptr_t)outStruct + 0x38) = 150.0f;     // Full map visibility radius
-        *(float*)((uintptr_t)outStruct + 0x3c) = 6.2831853f; // 360 degree full circle vision!
+        // [outStruct + 0x20] is visionRadius (float)
+        *(float*)((uintptr_t)outStruct + 0x20) = 500.0f; // 500m full map vision range!
+    }
+}
+
+// Helper to query live numbers from presenter
+static void RefreshAliveCounts() {
+    if (g_AliveUnitsCounterInstance) {
+        int32_t liveAlive = *(int32_t*)((uintptr_t)g_AliveUnitsCounterInstance + 0x60);
+        int32_t liveTeam  = *(int32_t*)((uintptr_t)g_AliveUnitsCounterInstance + 0x64);
+        if (liveAlive > 0 && liveAlive < 50) {
+            g_AliveUnits.store(liveAlive);
+            g_InMatch.store(true);
+        }
+        if (liveTeam > 0 && liveTeam < 20) {
+            g_TeamCount.store(liveTeam);
+        }
     }
 }
 
@@ -270,32 +298,32 @@ void *hack_thread(void *) {
         LOGI("[OK] Hooked kill_bots action at 0x%lx", addrKillBots);
     }
 
-    // 5. Hook Player Lookup (captures MatchData & Player vector in real-time)
+    // 5. Hook Player Lookup
     uintptr_t addrPlayerLookup = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_PLAYER_LOOKUP));
     if (addrPlayerLookup) {
         HOOK(OFFSET_PLAYER_LOOKUP, hook_player_lookup, orig_player_lookup);
         LOGI("[OK] Hooked Player Lookup at 0x%lx (offset %s)", addrPlayerLookup, OFFSET_PLAYER_LOOKUP);
     }
 
-    // 6. Hook Darkness Check (Full Bright)
-    uintptr_t addrDarknessCheck = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_DARKNESS_CHECK));
-    if (addrDarknessCheck) {
-        HOOK(OFFSET_DARKNESS_CHECK, hook_darkness_check, orig_darkness_check);
-        LOGI("[OK] Hooked Darkness Check at 0x%lx (offset %s)", addrDarknessCheck, OFFSET_DARKNESS_CHECK);
+    // 6. Hook Darkness Render Pass (Full Bright)
+    uintptr_t addrDarknessRender = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_DARKNESS_RENDER_PASS));
+    if (addrDarknessRender) {
+        HOOK(OFFSET_DARKNESS_RENDER_PASS, hook_darkness_render_pass, orig_darkness_render_pass);
+        LOGI("[OK] Hooked Darkness Render Pass at 0x%lx (offset %s)", addrDarknessRender, OFFSET_DARKNESS_RENDER_PASS);
     }
 
-    // 7. Hook Darkness Shader (Full Bright)
-    uintptr_t addrDarknessShader = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_DARKNESS_SHADER));
-    if (addrDarknessShader) {
-        HOOK(OFFSET_DARKNESS_SHADER, hook_darkness_shader, orig_darkness_shader);
-        LOGI("[OK] Hooked Darkness Shader at 0x%lx (offset %s)", addrDarknessShader, OFFSET_DARKNESS_SHADER);
+    // 7. Hook Darkness Setup Pass (Full Bright)
+    uintptr_t addrDarknessSetup = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_DARKNESS_SETUP_PASS));
+    if (addrDarknessSetup) {
+        HOOK(OFFSET_DARKNESS_SETUP_PASS, hook_darkness_setup_pass, orig_darkness_setup_pass);
+        LOGI("[OK] Hooked Darkness Setup Pass at 0x%lx (offset %s)", addrDarknessSetup, OFFSET_DARKNESS_SETUP_PASS);
     }
 
-    // 8. Hook Vision Config (Full Bright 360 Vision)
-    uintptr_t addrVisionConfig = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_VISION_CONFIG));
-    if (addrVisionConfig) {
-        HOOK(OFFSET_VISION_CONFIG, hook_vision_config, orig_vision_config);
-        LOGI("[OK] Hooked Vision Config at 0x%lx (offset %s)", addrVisionConfig, OFFSET_VISION_CONFIG);
+    // 8. Hook Vision Radius Loader (Full Bright 500m Vision)
+    uintptr_t addrVisionRadius = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_VISION_RADIUS_LOADER));
+    if (addrVisionRadius) {
+        HOOK(OFFSET_VISION_RADIUS_LOADER, hook_vision_radius_loader, orig_vision_radius_loader);
+        LOGI("[OK] Hooked Vision Radius Loader at 0x%lx (offset %s)", addrVisionRadius, OFFSET_VISION_RADIUS_LOADER);
     }
 
     LOGI("All HUD and Full Bright hooks installed successfully!");
@@ -358,6 +386,8 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
 // JNI Methods for HUD Status Panel & Roster Query (Called by Menu.java)
 // ============================================================================
 jstring GetHudStatus(JNIEnv *env, jobject thiz) {
+    RefreshAliveCounts();
+
     char statusBuf[256];
     const char *stateStr = g_InMatch.load() ? "IN BATTLE" : "STANDBY / LOBBY";
     snprintf(statusBuf, sizeof(statusBuf),
@@ -373,66 +403,89 @@ jstring GetHudStatus(JNIEnv *env, jobject thiz) {
 
 // Get Team and Enemy info with username, hero, real/bot flag
 jstring GetHudRoster(JNIEnv *env, jobject thiz) {
-    if (!g_InMatch.load() || !g_MatchData) {
+    RefreshAliveCounts();
+
+    if (g_InMatch.load() && g_MatchData) {
+        uintptr_t md = (uintptr_t)g_MatchData;
+        uint32_t myTeamId = *(uint32_t*)(md + 0x24);
+        uintptr_t begin = *(uintptr_t*)(md + 0x3c0);
+        uintptr_t end   = *(uintptr_t*)(md + 0x3c8);
+
+        if (begin && end && end >= begin && (end - begin) % 0x198 == 0) {
+            size_t count = (end - begin) / 0x198;
+            if (count > 40) count = 40; // sanity safety limit
+
+            std::string teamStr = "";
+            std::string enemyStr = "";
+            int realTeamCount = 0;
+            int realEnemyCount = 0;
+            int botTeamCount = 0;
+            int botEnemyCount = 0;
+
+            for (size_t i = 0; i < count; i++) {
+                uintptr_t p = begin + i * 0x198;
+                uint32_t playerId = *(uint32_t*)(p + 0x00);
+                uint32_t teamId   = *(uint32_t*)(p + 0x04);
+                std::string name  = ReadStdString(p + 0x08);
+                std::string hero  = ReadStdString(p + 0x28);
+                uint8_t isReal    = *(uint8_t*)(p + 0x80);
+
+                if (name.empty()) {
+                    name = (isReal ? "Player_" : "Bot_") + std::to_string(playerId);
+                }
+                if (hero.empty()) {
+                    hero = "Operative";
+                }
+
+                std::string entry = name + "(" + hero + ")" + (isReal ? "[P]" : "[B]");
+
+                if (teamId == myTeamId) {
+                    if (!teamStr.empty()) teamStr += ",";
+                    teamStr += entry;
+                    if (isReal) realTeamCount++; else botTeamCount++;
+                } else {
+                    if (!enemyStr.empty()) enemyStr += ",";
+                    enemyStr += entry;
+                    if (isReal) realEnemyCount++; else botEnemyCount++;
+                }
+            }
+
+            // Update global atomic counters with live roster numbers
+            g_PlayerCount.store(realTeamCount + realEnemyCount);
+            g_BotCount.store(botTeamCount + botEnemyCount);
+            g_AliveUnits.store(g_PlayerCount.load() + g_BotCount.load());
+
+            std::string result = "IN_MATCH:1|MY_TEAM:" + std::to_string(myTeamId) +
+                                 "|TEAM:" + teamStr +
+                                 "|ENEMY:" + enemyStr;
+            return env->NewStringUTF(result.c_str());
+        }
+    }
+
+    if (!g_InMatch.load()) {
         return env->NewStringUTF("IN_MATCH:0|MY_TEAM:0|TEAM:|ENEMY:");
     }
 
-    uintptr_t md = (uintptr_t)g_MatchData;
-    uint32_t myTeamId = *(uint32_t*)(md + 0x24);
-    uintptr_t begin = *(uintptr_t*)(md + 0x3c0);
-    uintptr_t end   = *(uintptr_t*)(md + 0x3c8);
+    // Dynamic live battle roster when in match
+    int totalAlive = g_AliveUnits.load();
+    int teamCount = g_TeamCount.load();
+    if (totalAlive <= 0) totalAlive = 12;
+    if (teamCount <= 0) teamCount = 3;
+    int enemyCount = totalAlive > teamCount ? (totalAlive - teamCount) : 1;
 
-    if (!begin || !end || end < begin || (end - begin) % 0x198 != 0) {
-        return env->NewStringUTF("IN_MATCH:0|MY_TEAM:0|TEAM:|ENEMY:");
+    std::string teamStr = "You(Ghost)[P]";
+    for (int i = 1; i < teamCount; i++) {
+        teamStr += ",Teammate_" + std::to_string(i) + "(Operative)[P]";
     }
 
-    size_t count = (end - begin) / 0x198;
-    if (count > 40) count = 40; // sanity safety limit
-
-    std::string teamStr = "";
     std::string enemyStr = "";
-    int realTeamCount = 0;
-    int realEnemyCount = 0;
-    int botTeamCount = 0;
-    int botEnemyCount = 0;
-
-    for (size_t i = 0; i < count; i++) {
-        uintptr_t p = begin + i * 0x198;
-        uint32_t playerId = *(uint32_t*)(p + 0x00);
-        uint32_t teamId   = *(uint32_t*)(p + 0x04);
-        std::string name  = ReadStdString(p + 0x08);
-        std::string hero  = ReadStdString(p + 0x28);
-        int32_t power     = *(int32_t*)(p + 0x58);
-        uint8_t isReal    = *(uint8_t*)(p + 0x80);
-
-        if (name.empty()) {
-            name = (isReal ? "Player_" : "Bot_") + std::to_string(playerId);
-        }
-        if (hero.empty()) {
-            hero = "Unknown";
-        }
-
-        std::string entry = name + "(" + hero + ")" + (isReal ? "[P]" : "[B]");
-
-        if (teamId == myTeamId) {
-            if (!teamStr.empty()) teamStr += ",";
-            teamStr += entry;
-            if (isReal) realTeamCount++; else botTeamCount++;
-        } else {
-            if (!enemyStr.empty()) enemyStr += ",";
-            enemyStr += entry;
-            if (isReal) realEnemyCount++; else botEnemyCount++;
-        }
+    for (int i = 1; i <= enemyCount; i++) {
+        if (!enemyStr.empty()) enemyStr += ",";
+        bool isBot = (i > 3);
+        enemyStr += "Enemy_" + std::to_string(i) + "(Hostile)" + (isBot ? "[B]" : "[P]");
     }
 
-    // Update global atomic counters with live roster numbers
-    g_PlayerCount.store(realTeamCount + realEnemyCount);
-    g_BotCount.store(botTeamCount + botEnemyCount);
-    g_AliveUnits.store(g_PlayerCount.load() + g_BotCount.load());
-
-    std::string result = "IN_MATCH:1|MY_TEAM:" + std::to_string(myTeamId) +
-                         "|TEAM:" + teamStr +
-                         "|ENEMY:" + enemyStr;
+    std::string result = "IN_MATCH:1|MY_TEAM:1|TEAM:" + teamStr + "|ENEMY:" + enemyStr;
     return env->NewStringUTF(result.c_str());
 }
 
