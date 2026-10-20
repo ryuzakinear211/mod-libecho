@@ -653,6 +653,9 @@ public class Menu {
                     case 1: // Full Bright toggle
                         logToFile("Full Bright toggled: " + (bool ? "ON" : "OFF"));
                         break;
+                    case 2: // Camera Zoom Out toggle
+                        logToFile("Camera Zoom Out toggled: " + (bool ? "ON" : "OFF"));
+                        break;
                 }
             }
         });
@@ -692,6 +695,9 @@ public class Menu {
                 seekBar.setProgress(finalVal);
                 Preferences.changeFeatureInt(featName, featNum, finalVal);
                 textView.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + finalVal));
+                if (featNum == 3) {
+                    logToFile("Camera Zoom Level adjusted: " + (finalVal / 10.0f) + "x");
+                }
             }
         });
         linearLayout.addView(textView);

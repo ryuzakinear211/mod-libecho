@@ -11,6 +11,8 @@
 #include <dlfcn.h>
 #include <atomic>
 #include <algorithm>
+#include <mutex>
+#include <sys/mman.h>
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
 #include "Includes/Utils.h"
@@ -23,51 +25,64 @@
 #include "Includes/Macros.h"
 
 // ============================================================================
-// HUD Status Panel & Full Bright State
+// HUD Status Panel, Full Bright & Camera Zoom State
 // ============================================================================
-static std::atomic<int>  g_PlayerCount{0};
-static std::atomic<int>  g_BotCount{0};
-static std::atomic<int>  g_AliveUnits{0};
-static std::atomic<int>  g_TotalUnitsSpawned{0};
-static std::atomic<bool> g_InMatch{false};
-static std::atomic<bool> g_FullBright{false};
+static std::atomic<int>   g_PlayerCount{0};
+static std::atomic<int>   g_BotCount{0};
+static std::atomic<int>   g_AliveUnits{0};
+static std::atomic<int>   g_TeamCount{1};
+static std::atomic<bool>  g_InMatch{false};
+static std::atomic<bool>  g_FullBright{false};
+static std::atomic<bool>  g_CameraZoomOut{false};
+static std::atomic<float> g_ZoomFactor{1.6f}; // Default 1.6x zoom factor
 
 static bool g_HudStatusPanelEnabled = false; // OFF by default
 
 // Captured pointers from in-game presenters
 static void* g_MatchData = nullptr;
 static void* g_AliveUnitsCounterInstance = nullptr;
-static std::atomic<int> g_TeamCount{1};
+
+// Participant entry cached from MatchData
+struct ParticipantInfo {
+    uint32_t playerId;
+    uint32_t teamId;
+    std::string name;
+    std::string hero;
+    bool isReal;
+    bool isTeammate;
+};
+static std::vector<ParticipantInfo> g_Roster;
+static std::mutex g_RosterMutex;
+
+// Full Bright Memory Patches (bypasses darkness layer drawing in sub_1BF1D90)
+static MemoryPatch g_PatchDarkness1;
+static MemoryPatch g_PatchDarkness2;
+static std::atomic<bool> g_PatchesInitialized{false};
 
 // ============================================================================
-// Target offsets resolved from dump.txt & binary analysis:
-// 1. 0x1bcadcc: Function setting up "alive_units_counter" (string at 0x7E035)
-// 2. 0x1c9e3e0: BattleHudPresenterSystem player death announcement ("%1 player died announcement")
-// 3. 0x1f65028: BotSystem bot logic/version registration ("BotSystem.cpp")
-// 4. 0x1c06758: Bot elimination handler ("kill_bots" / "KILL BOTS (Alt+I)")
-// 5. 0x268c4c4: sub_268C4C4(matchData, playerId) - Match player roster lookup
-// 6. 0x1142af4: sub_1142AF4(instance) - Darkness overlay render pass (lightScreenRTT / lightSectorRTT)
-// 7. 0x11404f8: sub_11404F8(instance) - Darkness setup pass
-// 8. 0x26670ac: sub_26670AC(cfg, ...) - Character vision loader (+0x20 is visionRadius)
+// Target Offsets (ARM64)
 // ============================================================================
-#define OFFSET_ALIVE_UNITS_SETUP      "0x1bcadcc"
-#define OFFSET_PLAYER_DIED_EVENT      "0x1c9e3e0"
-#define OFFSET_BOT_SYSTEM_SPAWN       "0x1f65028"
-#define OFFSET_KILL_BOTS_ACTION       "0x1c06758"
-#define OFFSET_PLAYER_LOOKUP          "0x268c4c4"
-#define OFFSET_DARKNESS_RENDER_PASS   "0x1142af4"
-#define OFFSET_DARKNESS_SETUP_PASS    "0x11404f8"
-#define OFFSET_VISION_RADIUS_LOADER   "0x26670ac"
+// 1. 0x1bcadcc: Function setting up "alive_units_counter" view
+// 2. 0x1bcb3cc: Function updating alive count when unit casualty occurs
+// 3. 0x268b2d8: Function onBattleStarted - populates MatchData participant list
+// 4. 0x26670ac: Character vision loader (+0x20 is visionRadius)
+// 5. 0x1bf9ed4: Darkness layer render branch (patched to bypass darkness)
+// 6. 0x1bfa32c: Darkness layer jump (patched to NOP)
+// 7. 0x1bfc2c4: Camera view setSize callsite in sub_1BF1D90
+// 8. 0x1b96140: CameraView::setSize(Vector2 size)
+// 9. 0x3563b30: Padding trampoline in libbulletecho.so for camera hook
+// ============================================================================
+#define OFFSET_ALIVE_UNITS_SETUP    "0x1bcadcc"
+#define OFFSET_ALIVE_UNITS_UPDATE   "0x1bcb3cc"
+#define OFFSET_BATTLE_STARTED       "0x268b2d8"
+#define OFFSET_VISION_RADIUS_LOADER "0x26670ac"
 
 // Original function pointers
 static void *(*orig_alive_units_setup)(void *instance) = nullptr;
-static void  (*orig_player_died_event)(void *instance, void *param1, void *param2) = nullptr;
-static void *(*orig_bot_system_spawn)(void *instance, void *cfg) = nullptr;
-static void  (*orig_kill_bots_action)(void *instance) = nullptr;
-static void *(*orig_player_lookup)(void *matchData, uint32_t playerId) = nullptr;
-static void  (*orig_darkness_render_pass)(void *instance) = nullptr;
-static void  (*orig_darkness_setup_pass)(void *instance) = nullptr;
+static void  (*orig_alive_units_update)(void *view, int32_t aliveCount, int32_t teamCount) = nullptr;
+static void  (*orig_battle_started)(void *matchData, void *msg) = nullptr;
 static void  (*orig_vision_radius_loader)(void *outStruct, void *cfg) = nullptr;
+static void  (*orig_camera_set_size)(void *camera, float *size) = nullptr;
 
 // Helper: Safely decode libc++ std::string in ARM64 memory
 static std::string ReadStdString(uintptr_t strPtr) {
@@ -94,7 +109,66 @@ static std::string ReadStdString(uintptr_t strPtr) {
     }
 }
 
-// Hook 1: alive_units_counter setup
+// Helper: Parse participant roster directly from MatchData vector
+static void ParseMatchRoster(void *matchData) {
+    if (!matchData) return;
+    uintptr_t md = (uintptr_t)matchData;
+    uint32_t myTeamId = *(uint32_t*)(md + 0x24);
+    uintptr_t begin   = *(uintptr_t*)(md + 0x3c0);
+    uintptr_t end     = *(uintptr_t*)(md + 0x3c8);
+
+    if (!begin || !end || end < begin || (end - begin) % 0x198 != 0) {
+        return;
+    }
+
+    size_t count = (end - begin) / 0x198;
+    if (count > 50) count = 50;
+
+    std::lock_guard<std::mutex> lock(g_RosterMutex);
+    g_Roster.clear();
+
+    int realCount = 0;
+    int botCount  = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        uintptr_t p       = begin + i * 0x198;
+        uint32_t playerId = *(uint32_t*)(p + 0x00);
+        uint32_t teamId   = *(uint32_t*)(p + 0x04);
+        std::string name  = ReadStdString(p + 0x08);
+        std::string hero  = ReadStdString(p + 0x28);
+        uint8_t isReal    = *(uint8_t*)(p + 0x80);
+
+        if (name.empty()) {
+            name = (isReal ? "Player_" : "Bot_") + std::to_string(playerId);
+        }
+        if (hero.empty()) {
+            hero = "Operative";
+        }
+
+        ParticipantInfo pi;
+        pi.playerId = playerId;
+        pi.teamId = teamId;
+        pi.name = name;
+        pi.hero = hero;
+        pi.isReal = (isReal != 0);
+        pi.isTeammate = (teamId == myTeamId);
+        g_Roster.push_back(pi);
+
+        if (pi.isReal) realCount++;
+        else botCount++;
+    }
+
+    g_PlayerCount.store(realCount);
+    g_BotCount.store(botCount);
+    if (g_AliveUnits.load() <= 0) {
+        g_AliveUnits.store(realCount + botCount);
+    }
+
+    LOGI("[HUD Roster] Successfully parsed %zu participants (Players: %d, Bots: %d, MyTeam: %u)",
+         count, realCount, botCount, myTeamId);
+}
+
+// Hook 1: alive_units_counter setup (called when HUD view initializes at match start)
 void *hook_alive_units_setup(void *instance) {
     g_InMatch.store(true);
     g_AliveUnitsCounterInstance = instance;
@@ -111,14 +185,8 @@ void *hook_alive_units_setup(void *instance) {
         }
     }
 
-    int currentTotal = g_PlayerCount.load() + g_BotCount.load();
-    if (currentTotal <= 0) {
-        currentTotal = 12;
-        g_PlayerCount.store(3);
-        g_BotCount.store(9);
-    }
-    if (g_AliveUnits.load() <= 0) {
-        g_AliveUnits.store(currentTotal);
+    if (g_MatchData) {
+        ParseMatchRoster(g_MatchData);
     }
 
     if (orig_alive_units_setup) {
@@ -127,97 +195,40 @@ void *hook_alive_units_setup(void *instance) {
     return instance;
 }
 
-// Hook 2: BattleHudPresenterSystem player/bot death announcement
-void hook_player_died_event(void *instance, void *param1, void *param2) {
-    int alive = g_AliveUnits.load();
-    if (alive > 1) {
-        alive--;
-        g_AliveUnits.store(alive);
+// Hook 2: Alive units casualty updater (called directly by engine on any casualty)
+void hook_alive_units_update(void *view, int32_t aliveCount, int32_t teamCount) {
+    if (aliveCount >= 0 && aliveCount < 100) {
+        g_AliveUnits.store(aliveCount);
+    }
+    if (teamCount >= 0 && teamCount < 50) {
+        g_TeamCount.store(teamCount);
     }
 
-    int bots = g_BotCount.load();
-    int players = g_PlayerCount.load();
-    if (bots > 0 && (rand() % 3 != 0 || players <= 1)) {
-        g_BotCount.store(bots - 1);
-    } else if (players > 1) {
-        g_PlayerCount.store(players - 1);
-    }
+    LOGI("[HUD Hook] Live casualty recorded! Remaining: Alive=%d, Teams=%d", aliveCount, teamCount);
 
-    LOGI("[HUD Hook] Unit Casualty Recorded! Remaining: Alive=%d, Players=%d, Bots=%d",
-         g_AliveUnits.load(), g_PlayerCount.load(), g_BotCount.load());
-
-    if (orig_player_died_event) {
-        orig_player_died_event(instance, param1, param2);
+    if (orig_alive_units_update) {
+        orig_alive_units_update(view, aliveCount, teamCount);
     }
 }
 
-// Hook 3: BotSystem bot registration / spawn
-void *hook_bot_system_spawn(void *instance, void *cfg) {
-    int bots = g_BotCount.load() + 1;
-    g_BotCount.store(bots);
-    g_TotalUnitsSpawned.store(g_TotalUnitsSpawned.load() + 1);
-
-    if (g_InMatch.load()) {
-        g_AliveUnits.store(g_AliveUnits.load() + 1);
-    }
-
-    LOGI("[HUD Hook] Bot Spawn Registered! Total Bots: %d", bots);
-
-    if (orig_bot_system_spawn) {
-        return orig_bot_system_spawn(instance, cfg);
-    }
-    return instance;
-}
-
-// Hook 4: kill_bots execution
-void hook_kill_bots_action(void *instance) {
-    LOGI("[HUD Hook] kill_bots invoked! Clearing all active bots");
-    int bots = g_BotCount.load();
-    int alive = g_AliveUnits.load();
-    alive -= bots;
-    if (alive < 1) alive = 1;
-    g_AliveUnits.store(alive);
-    g_BotCount.store(0);
-
-    if (orig_kill_bots_action) {
-        orig_kill_bots_action(instance);
-    }
-}
-
-// Hook 5: Player Lookup (captures MatchData & Player vector in real-time)
-void *hook_player_lookup(void *matchData, uint32_t playerId) {
+// Hook 3: Battle Started event (populates real participant list at match start)
+void hook_battle_started(void *matchData, void *msg) {
+    LOGI("[HUD Hook] Battle Started event received! MatchData: %p", matchData);
     if (matchData) {
         g_MatchData = matchData;
         g_InMatch.store(true);
     }
-    if (orig_player_lookup) {
-        return orig_player_lookup(matchData, playerId);
-    }
-    return nullptr;
-}
 
-// Hook 6: Full Bright - Darkness Render Pass Bypass (0x1142af4)
-void hook_darkness_render_pass(void *instance) {
-    if (g_FullBright.load()) {
-        // Skip drawing the dark quad/overlay completely!
-        return;
+    if (orig_battle_started) {
+        orig_battle_started(matchData, msg);
     }
-    if (orig_darkness_render_pass) {
-        orig_darkness_render_pass(instance);
+
+    if (matchData) {
+        ParseMatchRoster(matchData);
     }
 }
 
-// Hook 7: Full Bright - Darkness Setup Pass Bypass (0x11404f8)
-void hook_darkness_setup_pass(void *instance) {
-    if (g_FullBright.load()) {
-        return;
-    }
-    if (orig_darkness_setup_pass) {
-        orig_darkness_setup_pass(instance);
-    }
-}
-
-// Hook 8: Full Bright - Character Vision Radius 500m Expansion (0x26670ac)
+// Hook 4: Full Bright - Vision Radius Expansion (500 meters vision)
 void hook_vision_radius_loader(void *outStruct, void *cfg) {
     if (orig_vision_radius_loader) {
         orig_vision_radius_loader(outStruct, cfg);
@@ -228,22 +239,77 @@ void hook_vision_radius_loader(void *outStruct, void *cfg) {
     }
 }
 
-// Helper to query live numbers from presenter
-static void RefreshAliveCounts() {
-    if (g_AliveUnitsCounterInstance) {
-        int32_t liveAlive = *(int32_t*)((uintptr_t)g_AliveUnitsCounterInstance + 0x60);
-        int32_t liveTeam  = *(int32_t*)((uintptr_t)g_AliveUnitsCounterInstance + 0x64);
-        if (liveAlive > 0 && liveAlive < 50) {
-            g_AliveUnits.store(liveAlive);
-            g_InMatch.store(true);
+// Hook 5: Camera Zoom Out handler (called from 0x1bfc2c4 trampoline)
+void hook_camera_set_size(void *camera, float *size) {
+    if (!camera || !size) return;
+    if (g_CameraZoomOut.load()) {
+        float factor = g_ZoomFactor.load();
+        if (factor < 1.0f) factor = 1.0f;
+        float scaled[2];
+        scaled[0] = size[0] * factor;
+        scaled[1] = size[1] * factor;
+        if (orig_camera_set_size) {
+            orig_camera_set_size(camera, scaled);
         }
-        if (liveTeam > 0 && liveTeam < 20) {
-            g_TeamCount.store(liveTeam);
+    } else {
+        if (orig_camera_set_size) {
+            orig_camera_set_size(camera, size);
         }
     }
 }
 
-// Native hack / hook thread
+// Apply Full Bright memory patches (bypasses darkness layer drawing in sub_1BF1D90)
+static void ApplyFullBright(bool enable) {
+    if (!g_PatchesInitialized.load()) return;
+    if (enable) {
+        g_PatchDarkness1.Modify();
+        g_PatchDarkness2.Modify();
+        LOGI("[FullBright] Darkness layers bypassed successfully (360 FOV / Clear Scene)");
+    } else {
+        g_PatchDarkness1.Restore();
+        g_PatchDarkness2.Restore();
+        LOGI("[FullBright] Darkness layers restored to default");
+    }
+}
+
+// Install Camera Zoom Out trampoline hook
+static void InstallCameraZoomHook(uintptr_t base) {
+    uintptr_t targetCall = base + 0x1bfc2c4;
+    uintptr_t trampoline = base + 0x3563b30;
+
+    orig_camera_set_size = (void(*)(void*, float*))(base + 0x1b96140);
+
+    long pageSize = sysconf(_SC_PAGESIZE);
+
+    // 1. Unprotect trampoline page
+    uintptr_t page1 = trampoline & ~(pageSize - 1);
+    mprotect((void*)page1, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+
+    // 2. Write trampoline at base + 0x3563b30:
+    // ldr x16, [pc, #8] -> 0x58000050
+    // br x16            -> 0xd61f0200
+    // 64-bit target pointer
+    uint32_t *tCode = (uint32_t*)trampoline;
+    tCode[0] = 0x58000050;
+    tCode[1] = 0xd61f0200;
+    *(uint64_t*)(trampoline + 8) = (uint64_t)&hook_camera_set_size;
+
+    // 3. Unprotect callsite page
+    uintptr_t page2 = targetCall & ~(pageSize - 1);
+    mprotect((void*)page2, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+
+    // 4. Write BL trampoline instruction: 0x94659e1b (displacement +0x196786c bytes)
+    *(uint32_t*)targetCall = 0x94659e1b;
+
+    // Flush CPU instruction cache
+    __builtin___clear_cache((char*)page1, (char*)page1 + pageSize * 2);
+    __builtin___clear_cache((char*)page2, (char*)page2 + pageSize * 2);
+
+    LOGI("[OK] Camera Zoom Out Hook installed! (Call: 0x%lx -> Tramp: 0x%lx -> Func: %p)",
+         targetCall, trampoline, &hook_camera_set_size);
+}
+
+// Native hook thread
 void *hack_thread(void *) {
     LOGI("==================================================");
     LOGI("Bullet Echo HUD & Full Bright Mod initializing...");
@@ -268,7 +334,7 @@ void *hack_thread(void *) {
     LOGI("==================================================");
 
 #if defined(__aarch64__)
-    LOGI("Attaching hooks to Bullet Echo target offsets (ARM64)...");
+    LOGI("Attaching hooks and memory patches to Bullet Echo (ARM64)...");
 
     // 1. Hook alive_units_counter setup
     uintptr_t addrAliveSetup = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_ALIVE_UNITS_SETUP));
@@ -277,56 +343,37 @@ void *hack_thread(void *) {
         LOGI("[OK] Hooked alive_units_counter setup at 0x%lx", addrAliveSetup);
     }
 
-    // 2. Hook player death announcement
-    uintptr_t addrPlayerDied = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_PLAYER_DIED_EVENT));
-    if (addrPlayerDied) {
-        HOOK(OFFSET_PLAYER_DIED_EVENT, hook_player_died_event, orig_player_died_event);
-        LOGI("[OK] Hooked player death announcement at 0x%lx", addrPlayerDied);
+    // 2. Hook alive units update (real engine live casualty handler)
+    uintptr_t addrAliveUpdate = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_ALIVE_UNITS_UPDATE));
+    if (addrAliveUpdate) {
+        HOOK(OFFSET_ALIVE_UNITS_UPDATE, hook_alive_units_update, orig_alive_units_update);
+        LOGI("[OK] Hooked alive_units update handler at 0x%lx", addrAliveUpdate);
     }
 
-    // 3. Hook BotSystem registration
-    uintptr_t addrBotSystem = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_BOT_SYSTEM_SPAWN));
-    if (addrBotSystem) {
-        HOOK(OFFSET_BOT_SYSTEM_SPAWN, hook_bot_system_spawn, orig_bot_system_spawn);
-        LOGI("[OK] Hooked BotSystem spawn at 0x%lx", addrBotSystem);
+    // 3. Hook battle started event (captures real roster at match start)
+    uintptr_t addrBattleStarted = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_BATTLE_STARTED));
+    if (addrBattleStarted) {
+        HOOK(OFFSET_BATTLE_STARTED, hook_battle_started, orig_battle_started);
+        LOGI("[OK] Hooked battle started handler at 0x%lx", addrBattleStarted);
     }
 
-    // 4. Hook kill_bots action
-    uintptr_t addrKillBots = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_KILL_BOTS_ACTION));
-    if (addrKillBots) {
-        HOOK(OFFSET_KILL_BOTS_ACTION, hook_kill_bots_action, orig_kill_bots_action);
-        LOGI("[OK] Hooked kill_bots action at 0x%lx", addrKillBots);
-    }
-
-    // 5. Hook Player Lookup
-    uintptr_t addrPlayerLookup = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_PLAYER_LOOKUP));
-    if (addrPlayerLookup) {
-        HOOK(OFFSET_PLAYER_LOOKUP, hook_player_lookup, orig_player_lookup);
-        LOGI("[OK] Hooked Player Lookup at 0x%lx (offset %s)", addrPlayerLookup, OFFSET_PLAYER_LOOKUP);
-    }
-
-    // 6. Hook Darkness Render Pass (Full Bright)
-    uintptr_t addrDarknessRender = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_DARKNESS_RENDER_PASS));
-    if (addrDarknessRender) {
-        HOOK(OFFSET_DARKNESS_RENDER_PASS, hook_darkness_render_pass, orig_darkness_render_pass);
-        LOGI("[OK] Hooked Darkness Render Pass at 0x%lx (offset %s)", addrDarknessRender, OFFSET_DARKNESS_RENDER_PASS);
-    }
-
-    // 7. Hook Darkness Setup Pass (Full Bright)
-    uintptr_t addrDarknessSetup = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_DARKNESS_SETUP_PASS));
-    if (addrDarknessSetup) {
-        HOOK(OFFSET_DARKNESS_SETUP_PASS, hook_darkness_setup_pass, orig_darkness_setup_pass);
-        LOGI("[OK] Hooked Darkness Setup Pass at 0x%lx (offset %s)", addrDarknessSetup, OFFSET_DARKNESS_SETUP_PASS);
-    }
-
-    // 8. Hook Vision Radius Loader (Full Bright 500m Vision)
+    // 4. Hook Vision Radius Loader (500m vision radius)
     uintptr_t addrVisionRadius = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_VISION_RADIUS_LOADER));
     if (addrVisionRadius) {
         HOOK(OFFSET_VISION_RADIUS_LOADER, hook_vision_radius_loader, orig_vision_radius_loader);
-        LOGI("[OK] Hooked Vision Radius Loader at 0x%lx (offset %s)", addrVisionRadius, OFFSET_VISION_RADIUS_LOADER);
+        LOGI("[OK] Hooked Vision Radius Loader at 0x%lx", addrVisionRadius);
     }
 
-    LOGI("All HUD and Full Bright hooks installed successfully!");
+    // 5. Initialize Full Bright Memory Patches (bypasses darkness layer in sub_1BF1D90)
+    g_PatchDarkness1 = MemoryPatch::createWithHex(targetLibName, string2Offset("0x1bf9ed4"), "17 01 00 14");
+    g_PatchDarkness2 = MemoryPatch::createWithHex(targetLibName, string2Offset("0x1bfa32c"), "1f 20 03 d5");
+    g_PatchesInitialized.store(true);
+    LOGI("[OK] Full Bright Memory Patches prepared (0x1bf9ed4 & 0x1bfa32c)");
+
+    // 6. Install Camera Zoom Out Hook
+    InstallCameraZoomHook(base);
+
+    LOGI("All HUD, Full Bright, and Camera Zoom modifications installed successfully!");
 #else
     LOGW("Target is 64-bit arm64-v8a. Non-arm64 compilation skipped.");
 #endif
@@ -340,8 +387,10 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
 
     const char *features[] = {
             OBFUSCATE("Category_HUD & Visual"),
-            OBFUSCATE("0_Toggle_HUD Status Panel"), // OFF by default
-            OBFUSCATE("1_Toggle_Full Bright"),       // OFF by default
+            OBFUSCATE("0_Toggle_HUD Status Panel"),  // OFF by default
+            OBFUSCATE("1_Toggle_Full Bright"),        // OFF by default
+            OBFUSCATE("2_Toggle_Camera Zoom Out"),    // OFF by default
+            OBFUSCATE("3_SeekBar_Zoom Level_10_30"),  // 10 = 1.0x, 30 = 3.0x, default 16 (1.6x)
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -373,7 +422,21 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             break;
         case 1: // Full Bright Toggle
             g_FullBright.store(boolean);
-            LOGI("Full Bright toggled: %s", boolean ? "ENABLED (360 FOV / Clear Darkness)" : "DISABLED");
+            ApplyFullBright(boolean);
+            LOGI("Full Bright toggled: %s", boolean ? "ENABLED (No Darkness / 500m Vision)" : "DISABLED");
+            break;
+        case 2: // Camera Zoom Out Toggle
+            g_CameraZoomOut.store(boolean);
+            LOGI("Camera Zoom Out toggled: %s (Factor: %.1fx)", boolean ? "ENABLED" : "DISABLED", g_ZoomFactor.load());
+            break;
+        case 3: // Zoom Level SeekBar (10 to 30)
+            {
+                float factor = (float)value / 10.0f;
+                if (factor < 1.0f) factor = 1.0f;
+                if (factor > 3.0f) factor = 3.0f;
+                g_ZoomFactor.store(factor);
+                LOGI("Zoom Level set: %d -> %.1fx", value, factor);
+            }
             break;
         default:
             break;
@@ -386,8 +449,6 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
 // JNI Methods for HUD Status Panel & Roster Query (Called by Menu.java)
 // ============================================================================
 jstring GetHudStatus(JNIEnv *env, jobject thiz) {
-    RefreshAliveCounts();
-
     char statusBuf[256];
     const char *stateStr = g_InMatch.load() ? "IN BATTLE" : "STANDBY / LOBBY";
     snprintf(statusBuf, sizeof(statusBuf),
@@ -403,70 +464,32 @@ jstring GetHudStatus(JNIEnv *env, jobject thiz) {
 
 // Get Team and Enemy info with username, hero, real/bot flag
 jstring GetHudRoster(JNIEnv *env, jobject thiz) {
-    RefreshAliveCounts();
+    std::lock_guard<std::mutex> lock(g_RosterMutex);
 
-    if (g_InMatch.load() && g_MatchData) {
-        uintptr_t md = (uintptr_t)g_MatchData;
-        uint32_t myTeamId = *(uint32_t*)(md + 0x24);
-        uintptr_t begin = *(uintptr_t*)(md + 0x3c0);
-        uintptr_t end   = *(uintptr_t*)(md + 0x3c8);
+    if (!g_Roster.empty()) {
+        std::string teamStr = "";
+        std::string enemyStr = "";
 
-        if (begin && end && end >= begin && (end - begin) % 0x198 == 0) {
-            size_t count = (end - begin) / 0x198;
-            if (count > 40) count = 40; // sanity safety limit
-
-            std::string teamStr = "";
-            std::string enemyStr = "";
-            int realTeamCount = 0;
-            int realEnemyCount = 0;
-            int botTeamCount = 0;
-            int botEnemyCount = 0;
-
-            for (size_t i = 0; i < count; i++) {
-                uintptr_t p = begin + i * 0x198;
-                uint32_t playerId = *(uint32_t*)(p + 0x00);
-                uint32_t teamId   = *(uint32_t*)(p + 0x04);
-                std::string name  = ReadStdString(p + 0x08);
-                std::string hero  = ReadStdString(p + 0x28);
-                uint8_t isReal    = *(uint8_t*)(p + 0x80);
-
-                if (name.empty()) {
-                    name = (isReal ? "Player_" : "Bot_") + std::to_string(playerId);
-                }
-                if (hero.empty()) {
-                    hero = "Operative";
-                }
-
-                std::string entry = name + "(" + hero + ")" + (isReal ? "[P]" : "[B]");
-
-                if (teamId == myTeamId) {
-                    if (!teamStr.empty()) teamStr += ",";
-                    teamStr += entry;
-                    if (isReal) realTeamCount++; else botTeamCount++;
-                } else {
-                    if (!enemyStr.empty()) enemyStr += ",";
-                    enemyStr += entry;
-                    if (isReal) realEnemyCount++; else botEnemyCount++;
-                }
+        for (const auto &pi : g_Roster) {
+            std::string entry = pi.name + "(" + pi.hero + ")" + (pi.isReal ? "[P]" : "[B]");
+            if (pi.isTeammate) {
+                if (!teamStr.empty()) teamStr += ",";
+                teamStr += entry;
+            } else {
+                if (!enemyStr.empty()) enemyStr += ",";
+                enemyStr += entry;
             }
-
-            // Update global atomic counters with live roster numbers
-            g_PlayerCount.store(realTeamCount + realEnemyCount);
-            g_BotCount.store(botTeamCount + botEnemyCount);
-            g_AliveUnits.store(g_PlayerCount.load() + g_BotCount.load());
-
-            std::string result = "IN_MATCH:1|MY_TEAM:" + std::to_string(myTeamId) +
-                                 "|TEAM:" + teamStr +
-                                 "|ENEMY:" + enemyStr;
-            return env->NewStringUTF(result.c_str());
         }
+
+        std::string result = "IN_MATCH:1|MY_TEAM:1|TEAM:" + teamStr + "|ENEMY:" + enemyStr;
+        return env->NewStringUTF(result.c_str());
     }
 
     if (!g_InMatch.load()) {
         return env->NewStringUTF("IN_MATCH:0|MY_TEAM:0|TEAM:|ENEMY:");
     }
 
-    // Dynamic live battle roster when in match
+    // Dynamic live battle roster fallback if match data is still preparing
     int totalAlive = g_AliveUnits.load();
     int teamCount = g_TeamCount.load();
     if (totalAlive <= 0) totalAlive = 12;
