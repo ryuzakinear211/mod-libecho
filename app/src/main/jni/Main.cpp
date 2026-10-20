@@ -50,12 +50,11 @@ static float g_VanillaCameraZoom = 1.0f;
 static std::vector<void*> g_VisionConfigs;
 static std::mutex g_VisionMutex;
 
-// Hero config caches for real-time Max Weapon Range toggle (persistent heap objects)
-static std::vector<void*> g_HeroConfigs;
-static std::mutex g_HeroMutex;
-
-// Max Weapon Range Memory Patch (0x265f564: mov w8, #0x461c0000 [9984.0f] -> "88 c3 a8 52")
-static MemoryPatch g_PatchWeaponRange;
+// Max Weapon Range Memory Patches (mov w8, #0x461c0000 [9984.0f] -> "88 c3 a8 52")
+// 1. 0x265f564: WeaponConfigLoader default flyDistance
+// 2. 0x265fe38: HeroConfigLoader default flyDistance
+static MemoryPatch g_PatchWeaponRange1;
+static MemoryPatch g_PatchWeaponRange2;
 
 // Participant entry cached from MatchData
 struct ParticipantInfo {
@@ -101,9 +100,8 @@ static std::atomic<bool> g_PatchesInitialized{false};
 #define OFFSET_DARKNESS_RENDER      "0x114054c"
 #define OFFSET_DARKNESS_SHADOWS     "0x1142af4"
 #define OFFSET_CAMERA_SET_ZOOM      "0x31d0594"
-#define OFFSET_WEAPON_CONFIG_LOADER "0x265f52c"
-#define OFFSET_HERO_CONFIG_LOADER   "0x265fdc4"
-#define OFFSET_WEAPON_RANGE_PATCH   "0x265f564"
+#define OFFSET_WEAPON_RANGE_PATCH1  "0x265f564"
+#define OFFSET_WEAPON_RANGE_PATCH2  "0x265fe38"
 
 // Original function pointers
 static void *(*orig_alive_units_setup)(void *instance) = nullptr;
@@ -115,8 +113,6 @@ static void  (*orig_match_finished)(void *instance, void *evt) = nullptr;
 static void  (*orig_leave_match)(void *instance, void *evt) = nullptr;
 static void *(*orig_main_menu)(void *instance) = nullptr;
 static void  (*orig_camera_set_zoom)(void *camera, float zoom) = nullptr;
-static void *(*orig_weapon_config_loader)(void *outStruct, void *cfg) = nullptr;
-static void *(*orig_hero_config_loader)(void *heroConfig, void *cfg) = nullptr;
 
 // Helper: Safely decode libc++ std::string in ARM64 memory
 static std::string ReadStdString(uintptr_t strPtr) {
@@ -157,10 +153,6 @@ static void ResetMatchState() {
     {
         std::lock_guard<std::mutex> lock(g_RosterMutex);
         g_Roster.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_HeroMutex);
-        g_HeroConfigs.clear();
     }
     LOGI("[HUD State] Match ended / transitioned to LOBBY. State reset.");
 }
@@ -268,6 +260,9 @@ void hook_alive_units_update(void *view, int32_t aliveCount, int32_t teamCount) 
     }
 }
 
+// Forward declarations
+static void UpdateActiveHeroWeaponRange(bool enable);
+
 // Hook 3: Battle Started event (populates real participant list at match start)
 void hook_battle_started(void *matchData, void *msg) {
     LOGI("[HUD Hook] Battle Started event received! MatchData: %p", matchData);
@@ -283,6 +278,10 @@ void hook_battle_started(void *matchData, void *msg) {
 
     if (matchData) {
         ParseMatchRoster(matchData);
+    }
+
+    if (g_MaxWeaponRange.load()) {
+        UpdateActiveHeroWeaponRange(true);
     }
 }
 
@@ -343,6 +342,52 @@ void *hook_main_menu(void *instance) {
 
 
 
+// Helper: Verify if an address range is safely readable/writable via pipe syscall (never segfaults)
+static bool IsSafeMemory(const void *addr, size_t len) {
+    if (!addr) return false;
+    uintptr_t p = (uintptr_t)addr;
+    if (p < 0x10000) return false;
+    int fd[2];
+    if (pipe(fd) < 0) return false;
+    bool ok = (write(fd[1], addr, len) == (ssize_t)len);
+    close(fd[0]);
+    close(fd[1]);
+    return ok;
+}
+
+// Safely update active local player weapon range in-match directly from PlayerManager singleton
+static void UpdateActiveHeroWeaponRange(bool enable) {
+    uintptr_t libBase = (uintptr_t)getAbsoluteAddress(targetLibName, 0);
+    if (!libBase) return;
+
+    void *managerSlot = (void*)(libBase + 0x375cc70);
+    if (!IsSafeMemory(managerSlot, sizeof(void*))) return;
+
+    uintptr_t manager = *(uintptr_t*)managerSlot;
+    if (!manager) return;
+
+    void *configSlot = (void*)(manager + 0x1a18);
+    if (!IsSafeMemory(configSlot, sizeof(void*))) return;
+
+    uintptr_t heroConfig = *(uintptr_t*)configSlot;
+    if (!heroConfig) return;
+
+    void *flyDistSlot = (void*)(heroConfig + 0x240);
+    if (!IsSafeMemory(flyDistSlot, 16)) return;
+
+    float dist = enable ? 10000.0f : 200.0f;
+    *(float*)(heroConfig + 0x240) = dist; // primary weapon flyDistance
+    *(float*)(heroConfig + 0x24c) = dist; // maxFlyDistance
+    if (enable) {
+        *(float*)(heroConfig + 0x244) = 0.0f; // pinpoint laser accuracy
+    }
+    if (IsSafeMemory((void*)(heroConfig + 0x340), sizeof(float))) {
+        *(float*)(heroConfig + 0x340) = dist; // secondary weapon flyDistance
+    }
+
+    LOGI("[WeaponRange] Real-time active hero config updated: flyDist=%.1fm (HeroConfig=%p)", dist, (void*)heroConfig);
+}
+
 // Hook 9: Real-time Camera Zoom Handler (0x31d0594: Camera::setZoom(void *camera, float zoom))
 // Called every frame by CameraPresenterSystem (0x1bdb978, 0x1bdbae0, 0x1bdbb38)
 void hook_camera_set_zoom(void *camera, float zoom) {
@@ -370,43 +415,14 @@ void hook_camera_set_zoom(void *camera, float zoom) {
             *(uint32_t*)((uintptr_t)camera + 0x88) = 3; // dirty flag
         }
     }
-}
 
-// Hook 10: Weapon Config Loader (0x265f52c: loads bullet flyDistance, flyDuration, flySpread)
-void *hook_weapon_config_loader(void *outStruct, void *cfg) {
-    void *res = outStruct;
-    if (orig_weapon_config_loader) {
-        res = orig_weapon_config_loader(outStruct, cfg);
-    }
-    if (res && g_MaxWeaponRange.load()) {
-        *(float*)((uintptr_t)res + 0x38) = 10000.0f; // default flyDistance (10km)
-        *(float*)((uintptr_t)res + 0x04) = 50.0f;    // flyDuration (50s)
-        *(float*)((uintptr_t)res + 0x00) = 0.0f;     // flySpread (pinpoint laser)
-    }
-    return res;
-}
-
-// Hook 12: Hero Config Loader (0x265fdc4: persistent HeroConfig heap object)
-void *hook_hero_config_loader(void *heroConfig, void *cfg) {
-    void *res = heroConfig;
-    if (orig_hero_config_loader) {
-        res = orig_hero_config_loader(heroConfig, cfg);
-    }
-    if (res) {
-        {
-            std::lock_guard<std::mutex> lock(g_HeroMutex);
-            if (std::find(g_HeroConfigs.begin(), g_HeroConfigs.end(), res) == g_HeroConfigs.end()) {
-                g_HeroConfigs.push_back(res);
-            }
-        }
-        if (g_MaxWeaponRange.load()) {
-            *(float*)((uintptr_t)res + 0x240) = 10000.0f; // Primary weapon fly distance (10km)
-            *(float*)((uintptr_t)res + 0x24c) = 10000.0f; // Max fly distance (10km)
-            *(float*)((uintptr_t)res + 0x244) = 0.0f;     // Pinpoint spread
-            *(float*)((uintptr_t)res + 0x340) = 10000.0f; // Secondary weapon fly distance (10km)
+    // Sync active hero weapon range during active match every 60 frames (~1 sec)
+    if (g_InMatch.load() && g_MaxWeaponRange.load()) {
+        static uint32_t s_rangeSyncCounter = 0;
+        if ((++s_rangeSyncCounter % 60) == 0) {
+            UpdateActiveHeroWeaponRange(true);
         }
     }
-    return res;
 }
 
 // Apply Full Bright memory patches (bypasses DarknessRTT passes: 0x114054c & 0x1142af4)
@@ -523,34 +539,17 @@ void *hack_thread(void *) {
     g_PatchesInitialized.store(true);
     LOGI("[OK] Full Bright DarknessRTT Memory Patches prepared (0x114054c & 0x1142af4)");
 
-    // 10. Hook Weapon Config Loader (0x265f52c - Max Weapon Range cross-map)
-    uintptr_t addrWeaponConfig = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_WEAPON_CONFIG_LOADER));
-    if (addrWeaponConfig) {
-        HOOK(OFFSET_WEAPON_CONFIG_LOADER, hook_weapon_config_loader, orig_weapon_config_loader);
-        LOGI("[OK] Hooked Weapon Config Loader at 0x%lx", addrWeaponConfig);
-    }
-
-    // 11. Hook Camera::setZoom (0x31d0594 - Real-time Camera Zoom Out)
+    // 10. Hook Camera::setZoom (0x31d0594 - Real-time Camera Zoom Out)
     uintptr_t addrCameraZoom = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_CAMERA_SET_ZOOM));
     if (addrCameraZoom) {
         HOOK(OFFSET_CAMERA_SET_ZOOM, hook_camera_set_zoom, orig_camera_set_zoom);
         LOGI("[OK] Hooked Camera::setZoom at 0x%lx", addrCameraZoom);
     }
 
-    // 12. Hook Hero Config Loader (0x265fdc4 - Real-time Hero Weapon tracking)
-    uintptr_t addrHeroConfig = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_HERO_CONFIG_LOADER));
-    if (addrHeroConfig) {
-        HOOK(OFFSET_HERO_CONFIG_LOADER, hook_hero_config_loader, orig_hero_config_loader);
-        LOGI("[OK] Hooked Hero Config Loader at 0x%lx", addrHeroConfig);
-    }
-
-    // 13. Initialize Max Weapon Range Memory Patch (0x265f564: mov w8, #0x461c0000 -> 88 c3 a8 52)
-    g_PatchWeaponRange = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_WEAPON_RANGE_PATCH), "88 c3 a8 52");
-    if (g_PatchWeaponRange.isValid()) {
-        LOGI("[OK] Max Weapon Range Memory Patch prepared at 0x265f564");
-    } else {
-        LOGE("[FAIL] Max Weapon Range Memory Patch failed to initialize at 0x265f564");
-    }
+    // 11. Initialize Max Weapon Range Memory Patches (mov w8, #0x461c0000 [9984.0f] -> 88 c3 a8 52)
+    g_PatchWeaponRange1 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_WEAPON_RANGE_PATCH1), "88 c3 a8 52");
+    g_PatchWeaponRange2 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_WEAPON_RANGE_PATCH2), "88 c3 a8 52");
+    LOGI("[OK] Max Weapon Range Memory Patches prepared (0x265f564 & 0x265fe38)");
 
     LOGI("All HUD, Full Bright, Camera Zoom, and Max Weapon Range modifications installed successfully!");
 #else
@@ -639,27 +638,15 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             break;
         case 4: // Max Weapon Range Toggle
             g_MaxWeaponRange.store(boolean);
-            if (g_PatchWeaponRange.isValid()) {
-                if (boolean) {
-                    g_PatchWeaponRange.Modify();
-                } else {
-                    g_PatchWeaponRange.Restore();
-                }
+            if (g_PatchWeaponRange1.isValid()) {
+                if (boolean) g_PatchWeaponRange1.Modify();
+                else g_PatchWeaponRange1.Restore();
             }
-            {
-                std::lock_guard<std::mutex> lock(g_HeroMutex);
-                for (void *hc : g_HeroConfigs) {
-                    if (hc) {
-                        float dist = boolean ? 10000.0f : 200.0f;
-                        *(float*)((uintptr_t)hc + 0x240) = dist;
-                        *(float*)((uintptr_t)hc + 0x24c) = dist;
-                        if (boolean) {
-                            *(float*)((uintptr_t)hc + 0x244) = 0.0f;
-                        }
-                        *(float*)((uintptr_t)hc + 0x340) = dist;
-                    }
-                }
+            if (g_PatchWeaponRange2.isValid()) {
+                if (boolean) g_PatchWeaponRange2.Modify();
+                else g_PatchWeaponRange2.Restore();
             }
+            UpdateActiveHeroWeaponRange(boolean);
             LOGI("Max Weapon Range toggled: %s (Cross-map 10km bullet range)", boolean ? "ENABLED" : "DISABLED");
             break;
         default:
