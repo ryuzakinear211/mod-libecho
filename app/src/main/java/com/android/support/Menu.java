@@ -157,6 +157,8 @@ public class Menu {
 
     native boolean IsInMatch();
 
+    native boolean IsLocalPlayerAlive();
+
     native boolean IsFullBright();
 
     //Here we write the code for our Menu
@@ -1376,8 +1378,8 @@ public class Menu {
         }
 
         int players = 0, bots = 0, alive = 0;
-        String status = "STANDBY";
-        boolean inBattle = false;
+        String status = "LOBBY";
+        boolean localAlive = false;
 
         if (rawStatus != null && !rawStatus.isEmpty()) {
             String[] parts = rawStatus.split("\\|");
@@ -1394,19 +1396,34 @@ public class Menu {
                         try { alive = Integer.parseInt(val); } catch (Exception ignored) {}
                     } else if ("STATUS".equals(key)) {
                         status = val;
+                    } else if ("LOCAL_ALIVE".equals(key)) {
+                        localAlive = "1".equals(val);
                     }
                 }
             }
         }
 
-        inBattle = status.contains("BATTLE") || alive > 0;
+        boolean inBattle = "ALIVE".equals(status) || "DEAD".equals(status) || status.contains("BATTLE");
+        if (inBattle && "ALIVE".equals(status)) {
+            localAlive = true;
+        } else if ("DEAD".equals(status)) {
+            localAlive = false;
+        }
 
         // Update status badge
         if (hudStatusBadge != null) {
-            hudStatusBadge.setText(" " + (inBattle ? "[IN-BATTLE]" : "[LOBBY]") + " ");
             GradientDrawable badgeGd = new GradientDrawable();
             badgeGd.setCornerRadius(dp(4));
-            badgeGd.setColor(inBattle ? Color.parseColor("#1B5E20") : Color.parseColor("#37474F"));
+            if (!inBattle) {
+                hudStatusBadge.setText(" [LOBBY] ");
+                badgeGd.setColor(Color.parseColor("#37474F"));
+            } else if (localAlive) {
+                hudStatusBadge.setText(" [ALIVE] ");
+                badgeGd.setColor(Color.parseColor("#1B5E20"));
+            } else {
+                hudStatusBadge.setText(" [DEAD / SPECTATING] ");
+                badgeGd.setColor(Color.parseColor("#B71C1C"));
+            }
             hudStatusBadge.setBackground(badgeGd);
         }
 
@@ -1421,7 +1438,7 @@ public class Menu {
         StringBuilder teamSb = new StringBuilder();
         StringBuilder enemySb = new StringBuilder();
 
-        if (rawRoster != null && rawRoster.contains("|")) {
+        if (inBattle && rawRoster != null && rawRoster.contains("|")) {
             String[] rParts = rawRoster.split("\\|");
             for (String rp : rParts) {
                 if (rp.startsWith("TEAM:")) {
@@ -1430,7 +1447,7 @@ public class Menu {
                         String[] members = list.split(",");
                         for (String m : members) {
                             teamCount++;
-                            teamSb.append(formatRosterEntry(m, true)).append("<br>");
+                            teamSb.append(formatRosterEntry(m, true, !localAlive)).append("<br>");
                         }
                     }
                 } else if (rp.startsWith("ENEMY:")) {
@@ -1439,7 +1456,7 @@ public class Menu {
                         String[] members = list.split(",");
                         for (String m : members) {
                             enemyCount++;
-                            enemySb.append(formatRosterEntry(m, false)).append("<br>");
+                            enemySb.append(formatRosterEntry(m, false, false)).append("<br>");
                         }
                     }
                 }
@@ -1453,25 +1470,33 @@ public class Menu {
             }
         }
 
-        if (teamCount == 0 && teamSb.length() == 0) {
-            teamSb.append("<font color='#78909C'><i>Lobby / Waiting for match...</i></font>");
-        } else if (teamSb.length() == 0) {
-            teamSb.append(formatRosterEntry("You(Player)[P]", true)).append("<br>");
-            for (int i = 1; i < teamCount; i++) {
-                teamSb.append(formatRosterEntry("Teammate_" + i + "(Ally)[P]", true)).append("<br>");
+        if (!inBattle) {
+            teamSb.setLength(0);
+            teamSb.append("<font color='#78909C'><i>Lobby / Waiting for battle...</i></font>");
+            enemySb.setLength(0);
+            enemySb.append("<font color='#78909C'><i>No active match</i></font>");
+        } else {
+            if (teamCount == 0 && teamSb.length() == 0) {
+                String youEntry = localAlive ? "You(Ghost)[P]" : "You(Ghost)[DEAD]";
+                teamSb.append(formatRosterEntry(youEntry, true, !localAlive)).append("<br>");
             }
-        }
-
-        if (enemyCount == 0 && enemySb.length() == 0) {
-            enemySb.append("<font color='#78909C'><i>No active enemies detected</i></font>");
-        } else if (enemySb.length() == 0) {
-            for (int i = 1; i <= enemyCount; i++) {
-                enemySb.append(formatRosterEntry("Enemy_" + i + "(Hostile)[P]", false)).append("<br>");
+            if (enemyCount == 0 && enemySb.length() == 0) {
+                enemySb.append("<font color='#78909C'><i>Scanning hostiles...</i></font>");
             }
         }
 
         if (hudSummaryRow != null) {
-            hudSummaryRow.setText(Html.fromHtml("<b>TEAM:</b> <font color='#00E676'><b>" + teamCount + "</b></font> | <b>ENEMIES:</b> <font color='#FF5252'><b>" + enemyCount + "</b></font> | <b>ALIVE:</b> <font color='#00E5FF'><b>" + alive + "</b></font>"));
+            if (!inBattle) {
+                hudSummaryRow.setText(Html.fromHtml("<b>STATUS:</b> <font color='#90A4AE'>STANDBY IN LOBBY</font>"));
+            } else {
+                String youStatusHtml = localAlive ?
+                        "<font color='#00E676'><b>ALIVE</b></font>" :
+                        "<font color='#FF5252'><b>ELIMINATED</b></font>";
+                hudSummaryRow.setText(Html.fromHtml("<b>YOU:</b> " + youStatusHtml +
+                        " | <b>TEAM:</b> <font color='#00E676'><b>" + teamCount + "</b></font>" +
+                        " | <b>ENEMIES:</b> <font color='#FF5252'><b>" + enemyCount + "</b></font>" +
+                        " | <b>ALIVE:</b> <font color='#00E5FF'><b>" + alive + "</b></font>"));
+            }
         }
 
         if (hudTeamList != null) {
@@ -1482,16 +1507,22 @@ public class Menu {
         }
     }
 
-    private String formatRosterEntry(String entry, boolean isAlly) {
-        // Format: Name(Hero)[P] or Name(Hero)[B]
-        boolean isReal = entry.endsWith("[P]");
-        String clean = entry.replace("[P]", "").replace("[B]", "");
+    private String formatRosterEntry(String entry, boolean isAlly, boolean isLocalDead) {
+        // Format: Name(Hero)[P] or Name(Hero)[B] or Name(Hero)[DEAD]
+        boolean isDead = entry.contains("[DEAD]") || (isAlly && isLocalDead && (entry.startsWith("You") || entry.contains("(Ghost)")));
+        boolean isReal = entry.endsWith("[P]") || entry.contains("[P]");
+        String clean = entry.replace("[P]", "").replace("[B]", "").replace("[DEAD]", "");
         String name = clean;
         String hero = "";
         int paren = clean.indexOf('(');
         if (paren != -1 && clean.endsWith(")")) {
             name = clean.substring(0, paren);
             hero = clean.substring(paren + 1, clean.length() - 1);
+        }
+
+        if (isDead) {
+            String heroStr = hero.isEmpty() ? "" : " <font color='#78909C'>(" + hero + ")</font>";
+            return "<font color='#FF5252'>&#9760;</font> <font color='#90A4AE'><s><b>" + name + "</b></s></font>" + heroStr + " <font color='#FF5252'>[DEAD]</font>";
         }
 
         String dot = isAlly ? "<font color='#00E676'>&#9679;</font>" : "<font color='#FF5252'>&#9679;</font>";

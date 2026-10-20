@@ -32,6 +32,7 @@ static std::atomic<int>   g_BotCount{0};
 static std::atomic<int>   g_AliveUnits{0};
 static std::atomic<int>   g_TeamCount{1};
 static std::atomic<bool>  g_InMatch{false};
+static std::atomic<bool>  g_LocalPlayerAlive{false};
 static std::atomic<bool>  g_FullBright{false};
 static std::atomic<bool>  g_CameraZoomOut{false};
 static std::atomic<float> g_ZoomFactor{1.6f}; // Default 1.6x zoom factor
@@ -41,6 +42,12 @@ static bool g_HudStatusPanelEnabled = false; // OFF by default
 // Captured pointers from in-game presenters
 static void* g_MatchData = nullptr;
 static void* g_AliveUnitsCounterInstance = nullptr;
+static void* g_CameraInstance = nullptr;
+static float g_OriginalCameraSize[2] = { 250.0f, 250.0f };
+
+// Hero vision config caches for real-time Full Bright toggle
+static std::vector<void*> g_VisionConfigs;
+static std::mutex g_VisionMutex;
 
 // Participant entry cached from MatchData
 struct ParticipantInfo {
@@ -54,7 +61,7 @@ struct ParticipantInfo {
 static std::vector<ParticipantInfo> g_Roster;
 static std::mutex g_RosterMutex;
 
-// Full Bright Memory Patches (bypasses darkness layer drawing in sub_1BF1D90)
+// Full Bright Memory Patches (bypasses DarknessRTT render passes: 0x114054c & 0x1142af4)
 static MemoryPatch g_PatchDarkness1;
 static MemoryPatch g_PatchDarkness2;
 static std::atomic<bool> g_PatchesInitialized{false};
@@ -66,22 +73,36 @@ static std::atomic<bool> g_PatchesInitialized{false};
 // 2. 0x1bcb3cc: Function updating alive count when unit casualty occurs
 // 3. 0x268b2d8: Function onBattleStarted - populates MatchData participant list
 // 4. 0x26670ac: Character vision loader (+0x20 is visionRadius)
-// 5. 0x1bf9ed4: Darkness layer render branch (patched to bypass darkness)
-// 6. 0x1bfa32c: Darkness layer jump (patched to NOP)
-// 7. 0x1bfc2c4: Camera view setSize callsite in sub_1BF1D90
-// 8. 0x1b96140: CameraView::setSize(Vector2 size)
-// 9. 0x3563b30: Padding trampoline in libbulletecho.so for camera hook
+// 5. 0x2558c64: Function onLocalPlayerDied - triggers when local player dies
+// 6. 0x28b818c: Function MatchFlow::Finished::enter - triggers when match ends
+// 7. 0x28c24a4: Function MatchFlow::enter(SpectatorWantToLeaveMatch) - triggers when leaving match
+// 8. 0x30aec60: Function MainMenuScreen::setup - triggers when entering main menu / lobby
+// 9. 0x114054c: DarknessRTT::render - main darkness render pass
+// 10. 0x1142af4: DarknessRTT::renderShadows - lightSectorRTT/lightScreenRTT pass
+// 11. 0x1b96140: CameraView::setSize(Vector2 size) - camera frustum setter
+// 12. 0x3563b30: Padding trampoline in libbulletecho.so for camera hook
 // ============================================================================
 #define OFFSET_ALIVE_UNITS_SETUP    "0x1bcadcc"
 #define OFFSET_ALIVE_UNITS_UPDATE   "0x1bcb3cc"
 #define OFFSET_BATTLE_STARTED       "0x268b2d8"
 #define OFFSET_VISION_RADIUS_LOADER "0x26670ac"
+#define OFFSET_PLAYER_DIED          "0x2558c64"
+#define OFFSET_MATCH_FINISHED       "0x28b818c"
+#define OFFSET_LEAVE_MATCH          "0x28c24a4"
+#define OFFSET_MAIN_MENU            "0x30aec60"
+#define OFFSET_DARKNESS_RENDER      "0x114054c"
+#define OFFSET_DARKNESS_SHADOWS     "0x1142af4"
+#define OFFSET_CAMERA_SET_SIZE      "0x1b96140"
 
 // Original function pointers
 static void *(*orig_alive_units_setup)(void *instance) = nullptr;
 static void  (*orig_alive_units_update)(void *view, int32_t aliveCount, int32_t teamCount) = nullptr;
 static void  (*orig_battle_started)(void *matchData, void *msg) = nullptr;
 static void  (*orig_vision_radius_loader)(void *outStruct, void *cfg) = nullptr;
+static void  (*orig_player_died)(void *instance, int32_t reason, void *extra) = nullptr;
+static void  (*orig_match_finished)(void *instance, void *evt) = nullptr;
+static void  (*orig_leave_match)(void *instance, void *evt) = nullptr;
+static void *(*orig_main_menu)(void *instance) = nullptr;
 static void  (*orig_camera_set_size)(void *camera, float *size) = nullptr;
 
 // Helper: Safely decode libc++ std::string in ARM64 memory
@@ -107,6 +128,24 @@ static std::string ReadStdString(uintptr_t strPtr) {
         buf[copyLen] = '\0';
         return std::string(buf);
     }
+}
+
+// Reset state when transitioning to lobby or match ends
+static void ResetMatchState() {
+    g_InMatch.store(false);
+    g_LocalPlayerAlive.store(false);
+    g_PlayerCount.store(0);
+    g_BotCount.store(0);
+    g_AliveUnits.store(0);
+    g_TeamCount.store(0);
+    g_MatchData = nullptr;
+    g_AliveUnitsCounterInstance = nullptr;
+    g_CameraInstance = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_RosterMutex);
+        g_Roster.clear();
+    }
+    LOGI("[HUD State] Match ended / transitioned to LOBBY. State reset.");
 }
 
 // Helper: Parse participant roster directly from MatchData vector
@@ -171,6 +210,7 @@ static void ParseMatchRoster(void *matchData) {
 // Hook 1: alive_units_counter setup (called when HUD view initializes at match start)
 void *hook_alive_units_setup(void *instance) {
     g_InMatch.store(true);
+    g_LocalPlayerAlive.store(true);
     g_AliveUnitsCounterInstance = instance;
     LOGI("[HUD Hook] alive_units_counter setup initialized! View: %p", instance);
 
@@ -217,6 +257,7 @@ void hook_battle_started(void *matchData, void *msg) {
     if (matchData) {
         g_MatchData = matchData;
         g_InMatch.store(true);
+        g_LocalPlayerAlive.store(true);
     }
 
     if (orig_battle_started) {
@@ -233,86 +274,158 @@ void hook_vision_radius_loader(void *outStruct, void *cfg) {
     if (orig_vision_radius_loader) {
         orig_vision_radius_loader(outStruct, cfg);
     }
-    if (g_FullBright.load() && outStruct) {
-        // [outStruct + 0x20] is visionRadius (float)
-        *(float*)((uintptr_t)outStruct + 0x20) = 500.0f; // 500m full map vision range!
+    if (outStruct) {
+        {
+            std::lock_guard<std::mutex> lock(g_VisionMutex);
+            if (std::find(g_VisionConfigs.begin(), g_VisionConfigs.end(), outStruct) == g_VisionConfigs.end()) {
+                g_VisionConfigs.push_back(outStruct);
+            }
+        }
+        if (g_FullBright.load()) {
+            *(float*)((uintptr_t)outStruct + 0x20) = 500.0f; // 500m full map vision range
+        }
     }
 }
 
-// Hook 5: Camera Zoom Out handler (called from 0x1bfc2c4 trampoline)
+// Hook 5: Local Player Died (detects when local hero dies in battle)
+void hook_player_died(void *instance, int32_t reason, void *extra) {
+    LOGI("[HUD Hook] Local player died! Reason: %d", reason);
+    g_LocalPlayerAlive.store(false);
+    if (orig_player_died) {
+        orig_player_died(instance, reason, extra);
+    }
+}
+
+// Hook 6: Match Finished event (detects when battle ends)
+void hook_match_finished(void *instance, void *evt) {
+    LOGI("[HUD Hook] Match Finished event received");
+    ResetMatchState();
+    if (orig_match_finished) {
+        orig_match_finished(instance, evt);
+    }
+}
+
+// Hook 7: Spectator leave match to lobby
+void hook_leave_match(void *instance, void *evt) {
+    LOGI("[HUD Hook] Player left match to lobby");
+    ResetMatchState();
+    if (orig_leave_match) {
+        orig_leave_match(instance, evt);
+    }
+}
+
+// Hook 8: Main Menu (Lobby) Screen initialization
+void *hook_main_menu(void *instance) {
+    LOGI("[HUD Hook] Returned to Main Menu / Lobby");
+    ResetMatchState();
+    if (orig_main_menu) {
+        return orig_main_menu(instance);
+    }
+    return instance;
+}
+
+// Hook 9: Camera Zoom Handler (called from 0x1b96140 trampoline and callsites)
 void hook_camera_set_size(void *camera, float *size) {
-    if (!camera || !size) return;
+    if (!camera) return;
+    g_CameraInstance = camera;
+    if (size) {
+        if (size[0] > 10.0f && size[1] > 10.0f) {
+            g_OriginalCameraSize[0] = size[0];
+            g_OriginalCameraSize[1] = size[1];
+        }
+    }
+
+    float finalSize[2] = { g_OriginalCameraSize[0], g_OriginalCameraSize[1] };
     if (g_CameraZoomOut.load()) {
         float factor = g_ZoomFactor.load();
         if (factor < 1.0f) factor = 1.0f;
-        float scaled[2];
-        scaled[0] = size[0] * factor;
-        scaled[1] = size[1] * factor;
-        if (orig_camera_set_size) {
-            orig_camera_set_size(camera, scaled);
-        }
-    } else {
-        if (orig_camera_set_size) {
-            orig_camera_set_size(camera, size);
-        }
+        if (factor > 3.0f) factor = 3.0f;
+        finalSize[0] *= factor;
+        finalSize[1] *= factor;
     }
+
+    // Original logic of 0x1b96140: store width, height to [camera + 0x88]
+    *(uint64_t*)((uintptr_t)camera + 0x88) = *(uint64_t*)finalSize;
 }
 
-// Apply Full Bright memory patches (bypasses darkness layer drawing in sub_1BF1D90)
+// Apply Full Bright memory patches (bypasses DarknessRTT passes: 0x114054c & 0x1142af4)
 static void ApplyFullBright(bool enable) {
     if (!g_PatchesInitialized.load()) return;
     if (enable) {
         g_PatchDarkness1.Modify();
         g_PatchDarkness2.Modify();
-        LOGI("[FullBright] Darkness layers bypassed successfully (360 FOV / Clear Scene)");
     } else {
         g_PatchDarkness1.Restore();
         g_PatchDarkness2.Restore();
-        LOGI("[FullBright] Darkness layers restored to default");
     }
+
+    // Also update all hero vision configs in memory for immediate in-match effect
+    float targetRadius = enable ? 500.0f : 100.0f;
+    {
+        std::lock_guard<std::mutex> lock(g_VisionMutex);
+        for (void *cfg : g_VisionConfigs) {
+            if (cfg) {
+                *(float*)((uintptr_t)cfg + 0x20) = targetRadius;
+            }
+        }
+    }
+    LOGI("[FullBright] %s (Darkness bypass & %.1fm vision across %zu hero configs)",
+         enable ? "ENABLED" : "DISABLED", targetRadius, g_VisionConfigs.size());
 }
 
 // Install Camera Zoom Out trampoline hook
 static void InstallCameraZoomHook(uintptr_t base) {
-    uintptr_t targetCall = base + 0x1bfc2c4;
     uintptr_t trampoline = base + 0x3563b30;
-
-    orig_camera_set_size = (void(*)(void*, float*))(base + 0x1b96140);
-
     long pageSize = sysconf(_SC_PAGESIZE);
 
-    // 1. Unprotect trampoline page
+    // 1. Unprotect trampoline page and write 64-bit jump to hook_camera_set_size
     uintptr_t page1 = trampoline & ~(pageSize - 1);
     mprotect((void*)page1, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
 
-    // 2. Write trampoline at base + 0x3563b30:
-    // ldr x16, [pc, #8] -> 0x58000050
-    // br x16            -> 0xd61f0200
-    // 64-bit target pointer
     uint32_t *tCode = (uint32_t*)trampoline;
-    tCode[0] = 0x58000050;
-    tCode[1] = 0xd61f0200;
+    tCode[0] = 0x58000050; // ldr x16, [pc, #8]
+    tCode[1] = 0xd61f0200; // br x16
     *(uint64_t*)(trampoline + 8) = (uint64_t)&hook_camera_set_size;
 
-    // 3. Unprotect callsite page
-    uintptr_t page2 = targetCall & ~(pageSize - 1);
-    mprotect((void*)page2, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+    // 2. Patch CameraView::setSize entry (0x1b96140) with direct branch B trampoline: 0x1467367c
+    uintptr_t targetFunc = base + 0x1b96140;
+    uintptr_t pageFunc = targetFunc & ~(pageSize - 1);
+    mprotect((void*)pageFunc, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+    *(uint32_t*)targetFunc = 0x1467367c; // B 0x3563b30
 
-    // 4. Write BL trampoline instruction: 0x94659e1b (displacement +0x196786c bytes)
-    *(uint32_t*)targetCall = 0x94659e1b;
+    // 3. Patch callsites with BL trampoline:
+    // ViewManager setupLevel callsite (0x1b8273c)
+    uintptr_t call1 = base + 0x1b8273c;
+    uintptr_t pageCall1 = call1 & ~(pageSize - 1);
+    mprotect((void*)pageCall1, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+    *(uint32_t*)call1 = 0x946784fd; // BL 0x3563b30
 
-    // Flush CPU instruction cache
+    // WeatherPresenterSystem update callsite (0x23a6998)
+    uintptr_t call2 = base + 0x23a6998;
+    uintptr_t pageCall2 = call2 & ~(pageSize - 1);
+    mprotect((void*)pageCall2, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+    *(uint32_t*)call2 = 0x9446f466; // BL 0x3563b30
+
+    // Debug menu callsite (0x1bfc2c4)
+    uintptr_t call3 = base + 0x1bfc2c4;
+    uintptr_t pageCall3 = call3 & ~(pageSize - 1);
+    mprotect((void*)pageCall3, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+    *(uint32_t*)call3 = 0x94659e1b; // BL 0x3563b30
+
+    // Flush CPU cache
     __builtin___clear_cache((char*)page1, (char*)page1 + pageSize * 2);
-    __builtin___clear_cache((char*)page2, (char*)page2 + pageSize * 2);
+    __builtin___clear_cache((char*)pageFunc, (char*)pageFunc + pageSize * 2);
+    __builtin___clear_cache((char*)pageCall1, (char*)pageCall1 + pageSize * 2);
+    __builtin___clear_cache((char*)pageCall2, (char*)pageCall2 + pageSize * 2);
+    __builtin___clear_cache((char*)pageCall3, (char*)pageCall3 + pageSize * 2);
 
-    LOGI("[OK] Camera Zoom Out Hook installed! (Call: 0x%lx -> Tramp: 0x%lx -> Func: %p)",
-         targetCall, trampoline, &hook_camera_set_size);
+    LOGI("[OK] Camera Zoom Out Hooks installed across entry (0x1b96140) and callsites (0x1b8273c, 0x23a6998, 0x1bfc2c4) -> Tramp 0x3563b30");
 }
 
 // Native hook thread
 void *hack_thread(void *) {
     LOGI("==================================================");
-    LOGI("Bullet Echo HUD & Full Bright Mod initializing...");
+    LOGI("Bullet Echo HUD, Full Bright & Camera Zoom Mod initializing...");
     LOGI("Log file destination: %s", kLogFilePath1);
     LOGI("==================================================");
 
@@ -336,41 +449,69 @@ void *hack_thread(void *) {
 #if defined(__aarch64__)
     LOGI("Attaching hooks and memory patches to Bullet Echo (ARM64)...");
 
-    // 1. Hook alive_units_counter setup
+    // 1. Hook alive_units_counter setup (0x1bcadcc)
     uintptr_t addrAliveSetup = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_ALIVE_UNITS_SETUP));
     if (addrAliveSetup) {
         HOOK(OFFSET_ALIVE_UNITS_SETUP, hook_alive_units_setup, orig_alive_units_setup);
         LOGI("[OK] Hooked alive_units_counter setup at 0x%lx", addrAliveSetup);
     }
 
-    // 2. Hook alive units update (real engine live casualty handler)
+    // 2. Hook alive units update (0x1bcb3cc - real engine live casualty handler)
     uintptr_t addrAliveUpdate = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_ALIVE_UNITS_UPDATE));
     if (addrAliveUpdate) {
         HOOK(OFFSET_ALIVE_UNITS_UPDATE, hook_alive_units_update, orig_alive_units_update);
         LOGI("[OK] Hooked alive_units update handler at 0x%lx", addrAliveUpdate);
     }
 
-    // 3. Hook battle started event (captures real roster at match start)
+    // 3. Hook battle started event (0x268b2d8 - captures real roster at match start)
     uintptr_t addrBattleStarted = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_BATTLE_STARTED));
     if (addrBattleStarted) {
         HOOK(OFFSET_BATTLE_STARTED, hook_battle_started, orig_battle_started);
         LOGI("[OK] Hooked battle started handler at 0x%lx", addrBattleStarted);
     }
 
-    // 4. Hook Vision Radius Loader (500m vision radius)
+    // 4. Hook Vision Radius Loader (0x26670ac - 500m vision radius)
     uintptr_t addrVisionRadius = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_VISION_RADIUS_LOADER));
     if (addrVisionRadius) {
         HOOK(OFFSET_VISION_RADIUS_LOADER, hook_vision_radius_loader, orig_vision_radius_loader);
         LOGI("[OK] Hooked Vision Radius Loader at 0x%lx", addrVisionRadius);
     }
 
-    // 5. Initialize Full Bright Memory Patches (bypasses darkness layer in sub_1BF1D90)
-    g_PatchDarkness1 = MemoryPatch::createWithHex(targetLibName, string2Offset("0x1bf9ed4"), "17 01 00 14");
-    g_PatchDarkness2 = MemoryPatch::createWithHex(targetLibName, string2Offset("0x1bfa32c"), "1f 20 03 d5");
-    g_PatchesInitialized.store(true);
-    LOGI("[OK] Full Bright Memory Patches prepared (0x1bf9ed4 & 0x1bfa32c)");
+    // 5. Hook Local Player Died (0x2558c64 - detects when local hero dies in battle)
+    uintptr_t addrPlayerDied = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_PLAYER_DIED));
+    if (addrPlayerDied) {
+        HOOK(OFFSET_PLAYER_DIED, hook_player_died, orig_player_died);
+        LOGI("[OK] Hooked Local Player Died handler at 0x%lx", addrPlayerDied);
+    }
 
-    // 6. Install Camera Zoom Out Hook
+    // 6. Hook Match Finished (0x28b818c - detects when battle ends)
+    uintptr_t addrMatchFinished = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_MATCH_FINISHED));
+    if (addrMatchFinished) {
+        HOOK(OFFSET_MATCH_FINISHED, hook_match_finished, orig_match_finished);
+        LOGI("[OK] Hooked Match Finished handler at 0x%lx", addrMatchFinished);
+    }
+
+    // 7. Hook Spectator Leave Match (0x28c24a4 - player leaves to lobby)
+    uintptr_t addrLeaveMatch = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_LEAVE_MATCH));
+    if (addrLeaveMatch) {
+        HOOK(OFFSET_LEAVE_MATCH, hook_leave_match, orig_leave_match);
+        LOGI("[OK] Hooked Spectator Leave Match handler at 0x%lx", addrLeaveMatch);
+    }
+
+    // 8. Hook Main Menu (0x30aec60 - main menu / lobby initialization)
+    uintptr_t addrMainMenu = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_MAIN_MENU));
+    if (addrMainMenu) {
+        HOOK(OFFSET_MAIN_MENU, hook_main_menu, orig_main_menu);
+        LOGI("[OK] Hooked Main Menu handler at 0x%lx", addrMainMenu);
+    }
+
+    // 9. Initialize Full Bright Memory Patches (DarknessRTT passes: 0x114054c & 0x1142af4 -> RET: c0 03 5f d6)
+    g_PatchDarkness1 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_DARKNESS_RENDER), "c0 03 5f d6");
+    g_PatchDarkness2 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_DARKNESS_SHADOWS), "c0 03 5f d6");
+    g_PatchesInitialized.store(true);
+    LOGI("[OK] Full Bright DarknessRTT Memory Patches prepared (0x114054c & 0x1142af4)");
+
+    // 10. Install Camera Zoom Out Hooks across CameraView::setSize and callsites
     InstallCameraZoomHook(base);
 
     LOGI("All HUD, Full Bright, and Camera Zoom modifications installed successfully!");
@@ -427,6 +568,11 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             break;
         case 2: // Camera Zoom Out Toggle
             g_CameraZoomOut.store(boolean);
+            if (g_CameraInstance) {
+                float factor = boolean ? g_ZoomFactor.load() : 1.0f;
+                float finalSize[2] = { g_OriginalCameraSize[0] * factor, g_OriginalCameraSize[1] * factor };
+                *(uint64_t*)((uintptr_t)g_CameraInstance + 0x88) = *(uint64_t*)finalSize;
+            }
             LOGI("Camera Zoom Out toggled: %s (Factor: %.1fx)", boolean ? "ENABLED" : "DISABLED", g_ZoomFactor.load());
             break;
         case 3: // Zoom Level SeekBar (10 to 30)
@@ -435,6 +581,10 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
                 if (factor < 1.0f) factor = 1.0f;
                 if (factor > 3.0f) factor = 3.0f;
                 g_ZoomFactor.store(factor);
+                if (g_CameraInstance && g_CameraZoomOut.load()) {
+                    float finalSize[2] = { g_OriginalCameraSize[0] * factor, g_OriginalCameraSize[1] * factor };
+                    *(uint64_t*)((uintptr_t)g_CameraInstance + 0x88) = *(uint64_t*)finalSize;
+                }
                 LOGI("Zoom Level set: %d -> %.1fx", value, factor);
             }
             break;
@@ -450,20 +600,28 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
 // ============================================================================
 jstring GetHudStatus(JNIEnv *env, jobject thiz) {
     char statusBuf[256];
-    const char *stateStr = g_InMatch.load() ? "IN BATTLE" : "STANDBY / LOBBY";
+    const char *stateStr = "LOBBY";
+    if (g_InMatch.load()) {
+        stateStr = g_LocalPlayerAlive.load() ? "ALIVE" : "DEAD";
+    }
     snprintf(statusBuf, sizeof(statusBuf),
-             "PLAYERS:%d|BOTS:%d|ALIVE:%d|STATUS:%s|ENABLED:%d|FULL_BRIGHT:%d",
+             "PLAYERS:%d|BOTS:%d|ALIVE:%d|STATUS:%s|ENABLED:%d|FULL_BRIGHT:%d|LOCAL_ALIVE:%d",
              g_PlayerCount.load(),
              g_BotCount.load(),
              g_AliveUnits.load(),
              stateStr,
              g_HudStatusPanelEnabled ? 1 : 0,
-             g_FullBright.load() ? 1 : 0);
+             g_FullBright.load() ? 1 : 0,
+             g_LocalPlayerAlive.load() ? 1 : 0);
     return env->NewStringUTF(statusBuf);
 }
 
 // Get Team and Enemy info with username, hero, real/bot flag
 jstring GetHudRoster(JNIEnv *env, jobject thiz) {
+    if (!g_InMatch.load()) {
+        return env->NewStringUTF("IN_MATCH:0|MY_TEAM:0|TEAM:|ENEMY:");
+    }
+
     std::lock_guard<std::mutex> lock(g_RosterMutex);
 
     if (!g_Roster.empty()) {
@@ -483,10 +641,6 @@ jstring GetHudRoster(JNIEnv *env, jobject thiz) {
 
         std::string result = "IN_MATCH:1|MY_TEAM:1|TEAM:" + teamStr + "|ENEMY:" + enemyStr;
         return env->NewStringUTF(result.c_str());
-    }
-
-    if (!g_InMatch.load()) {
-        return env->NewStringUTF("IN_MATCH:0|MY_TEAM:0|TEAM:|ENEMY:");
     }
 
     // Dynamic live battle roster fallback if match data is still preparing
@@ -528,6 +682,10 @@ jboolean IsInMatch(JNIEnv *env, jobject thiz) {
     return g_InMatch.load() ? JNI_TRUE : JNI_FALSE;
 }
 
+jboolean IsLocalPlayerAlive(JNIEnv *env, jobject thiz) {
+    return (g_InMatch.load() && g_LocalPlayerAlive.load()) ? JNI_TRUE : JNI_FALSE;
+}
+
 jboolean IsFullBright(JNIEnv *env, jobject thiz) {
     return g_FullBright.load() ? JNI_TRUE : JNI_FALSE;
 }
@@ -541,20 +699,21 @@ void lib_main() {
 
 int RegisterMenu(JNIEnv *env) {
     JNINativeMethod methods[] = {
-            {OBFUSCATE("Icon"),             OBFUSCATE("()Ljava/lang/String;"),                                                  reinterpret_cast<void *>(Icon)},
-            {OBFUSCATE("IconWebViewData"),  OBFUSCATE("()Ljava/lang/String;"),                                                  reinterpret_cast<void *>(IconWebViewData)},
-            {OBFUSCATE("IsGameLibLoaded"),  OBFUSCATE("()Z"),                                                                   reinterpret_cast<void *>(isGameLibLoaded)},
-            {OBFUSCATE("Init"),             OBFUSCATE("(Landroid/content/Context;Landroid/widget/TextView;Landroid/widget/TextView;)V"), reinterpret_cast<void *>(Init)},
-            {OBFUSCATE("SettingsList"),     OBFUSCATE("()[Ljava/lang/String;"),                                                 reinterpret_cast<void *>(SettingsList)},
-            {OBFUSCATE("GetFeatureList"),   OBFUSCATE("()[Ljava/lang/String;"),                                                 reinterpret_cast<void *>(GetFeatureList)},
+            {OBFUSCATE("Icon"),                OBFUSCATE("()Ljava/lang/String;"),                                                  reinterpret_cast<void *>(Icon)},
+            {OBFUSCATE("IconWebViewData"),     OBFUSCATE("()Ljava/lang/String;"),                                                  reinterpret_cast<void *>(IconWebViewData)},
+            {OBFUSCATE("IsGameLibLoaded"),     OBFUSCATE("()Z"),                                                                   reinterpret_cast<void *>(isGameLibLoaded)},
+            {OBFUSCATE("Init"),                OBFUSCATE("(Landroid/content/Context;Landroid/widget/TextView;Landroid/widget/TextView;)V"), reinterpret_cast<void *>(Init)},
+            {OBFUSCATE("SettingsList"),        OBFUSCATE("()[Ljava/lang/String;"),                                                 reinterpret_cast<void *>(SettingsList)},
+            {OBFUSCATE("GetFeatureList"),      OBFUSCATE("()[Ljava/lang/String;"),                                                 reinterpret_cast<void *>(GetFeatureList)},
             // HUD Status Panel & Full Bright JNI exports
-            {OBFUSCATE("GetHudStatus"),     OBFUSCATE("()Ljava/lang/String;"),                                                  reinterpret_cast<void *>(GetHudStatus)},
-            {OBFUSCATE("GetHudRoster"),     OBFUSCATE("()Ljava/lang/String;"),                                                  reinterpret_cast<void *>(GetHudRoster)},
-            {OBFUSCATE("GetPlayerCount"),   OBFUSCATE("()I"),                                                                   reinterpret_cast<void *>(GetPlayerCount)},
-            {OBFUSCATE("GetBotCount"),      OBFUSCATE("()I"),                                                                   reinterpret_cast<void *>(GetBotCount)},
-            {OBFUSCATE("GetAliveCount"),    OBFUSCATE("()I"),                                                                   reinterpret_cast<void *>(GetAliveCount)},
-            {OBFUSCATE("IsInMatch"),        OBFUSCATE("()Z"),                                                                   reinterpret_cast<void *>(IsInMatch)},
-            {OBFUSCATE("IsFullBright"),     OBFUSCATE("()Z"),                                                                   reinterpret_cast<void *>(IsFullBright)},
+            {OBFUSCATE("GetHudStatus"),        OBFUSCATE("()Ljava/lang/String;"),                                                  reinterpret_cast<void *>(GetHudStatus)},
+            {OBFUSCATE("GetHudRoster"),        OBFUSCATE("()Ljava/lang/String;"),                                                  reinterpret_cast<void *>(GetHudRoster)},
+            {OBFUSCATE("GetPlayerCount"),      OBFUSCATE("()I"),                                                                   reinterpret_cast<void *>(GetPlayerCount)},
+            {OBFUSCATE("GetBotCount"),         OBFUSCATE("()I"),                                                                   reinterpret_cast<void *>(GetBotCount)},
+            {OBFUSCATE("GetAliveCount"),       OBFUSCATE("()I"),                                                                   reinterpret_cast<void *>(GetAliveCount)},
+            {OBFUSCATE("IsInMatch"),           OBFUSCATE("()Z"),                                                                   reinterpret_cast<void *>(IsInMatch)},
+            {OBFUSCATE("IsLocalPlayerAlive"),  OBFUSCATE("()Z"),                                                                   reinterpret_cast<void *>(IsLocalPlayerAlive)},
+            {OBFUSCATE("IsFullBright"),        OBFUSCATE("()Z"),                                                                   reinterpret_cast<void *>(IsFullBright)},
     };
 
     jclass clazz = env->FindClass(OBFUSCATE("com/android/support/Menu"));
