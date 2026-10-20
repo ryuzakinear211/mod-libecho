@@ -119,16 +119,15 @@ public class Menu {
     LinearLayout hudContentContainer;
     TextView hudHeaderTitle;
     TextView hudStatusBadge;
-    TextView hudPlayersRow;
-    TextView hudBotsRow;
-    TextView hudAliveRow;
+    TextView hudSummaryRow;
+    TextView hudTeamHeader;
+    TextView hudTeamList;
+    TextView hudEnemyHeader;
+    TextView hudEnemyList;
     TextView hudCompactText;
+    ScrollView hudRosterScroll;
     boolean isHudCompact = false;
-    boolean isHudEnabled = true;
-    boolean showBotCount = true;
-    boolean showPlayerCount = true;
-    int hudOpacity = 85;
-    int hudTextSize = 13;
+    boolean isHudEnabled = false; // OFF by default
     Handler hudUpdateHandler;
     Runnable hudUpdateRunnable;
 
@@ -145,8 +144,10 @@ public class Menu {
 
     native boolean IsGameLibLoaded();
 
-    // HUD Status Panel native methods
+    // HUD Status Panel & Full Bright native methods
     native String GetHudStatus();
+
+    native String GetHudRoster();
 
     native int GetPlayerCount();
 
@@ -155,6 +156,8 @@ public class Menu {
     native int GetAliveCount();
 
     native boolean IsInMatch();
+
+    native boolean IsFullBright();
 
     //Here we write the code for our Menu
     // Reference: https://www.androidhive.info/2016/11/android-floating-widget-like-facebook-chat-head/
@@ -629,26 +632,26 @@ public class Menu {
                         Preferences.isExpanded = bool;
                         scrollView.setLayoutParams(bool ? scrlLLExpanded : scrlLL);
                         break;
-                    case 0: // HUD Status Panel toggle
+                    case 0: // HUD Status Panel toggle (OFF by default)
                         isHudEnabled = bool;
                         if (hudRootFrame != null) {
+                            if (bool && getContext != null) {
+                                int screenWidth = getContext.getResources().getDisplayMetrics().widthPixels;
+                                int panelW = dp(270);
+                                hudParams.x = Math.max(0, (screenWidth - panelW) / 2);
+                                hudParams.y = dp(25);
+                                if (mWindowManager != null) {
+                                    try {
+                                        mWindowManager.updateViewLayout(hudRootFrame, hudParams);
+                                    } catch (Exception ignored) {}
+                                }
+                            }
                             hudRootFrame.setVisibility(bool ? View.VISIBLE : View.GONE);
                         }
-                        logToFile("HUD Status Panel toggled: " + (bool ? "VISIBLE" : "HIDDEN"));
+                        logToFile("HUD Status Panel toggled: " + (bool ? "VISIBLE (TOP-CENTER)" : "HIDDEN"));
                         break;
-                    case 1: // Show Bot Count
-                        showBotCount = bool;
-                        if (hudBotsRow != null) {
-                            hudBotsRow.setVisibility(bool ? View.VISIBLE : View.GONE);
-                        }
-                        logToFile("Show Bot Count toggled: " + bool);
-                        break;
-                    case 2: // Show Player Count
-                        showPlayerCount = bool;
-                        if (hudPlayersRow != null) {
-                            hudPlayersRow.setVisibility(bool ? View.VISIBLE : View.GONE);
-                        }
-                        logToFile("Show Player Count toggled: " + bool);
+                    case 1: // Full Bright toggle
+                        logToFile("Full Bright toggled: " + (bool ? "ON" : "OFF"));
                         break;
                 }
             }
@@ -689,16 +692,6 @@ public class Menu {
                 seekBar.setProgress(finalVal);
                 Preferences.changeFeatureInt(featName, featNum, finalVal);
                 textView.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + finalVal));
-
-                if (featNum == 3) { // HUD Opacity
-                    hudOpacity = finalVal;
-                    if (hudPanelContainer != null) {
-                        hudPanelContainer.setAlpha((float) hudOpacity / 100.0f);
-                    }
-                } else if (featNum == 4) { // HUD Text Size
-                    hudTextSize = finalVal;
-                    applyHudTextSize(hudTextSize);
-                }
             }
         });
         linearLayout.addView(textView);
@@ -1179,6 +1172,7 @@ public class Menu {
     // ========================================================================
     private void initHudStatusPanel(final Context context) {
         hudRootFrame = new FrameLayout(context);
+        hudRootFrame.setVisibility(View.GONE); // OFF by default
 
         int iparams = Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O ? 2038 : 2002;
         hudParams = new WindowManager.LayoutParams(
@@ -1190,32 +1184,48 @@ public class Menu {
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
         );
+        int screenWidth = context.getResources().getDisplayMetrics().widthPixels;
+        int panelWidth = dp(270);
         hudParams.gravity = 51; // Gravity.TOP | Gravity.LEFT
-        hudParams.x = dp(15);
-        hudParams.y = dp(75);
+        hudParams.x = Math.max(0, (screenWidth - panelWidth) / 2); // Top Center!
+        hudParams.y = dp(25); // Top margin
 
         hudPanelContainer = new LinearLayout(context);
         hudPanelContainer.setOrientation(LinearLayout.VERTICAL);
-        hudPanelContainer.setPadding(dp(12), dp(8), dp(12), dp(8));
+        hudPanelContainer.setPadding(dp(12), dp(6), dp(12), dp(10));
 
+        // 100% Solid dark futuristic theme with neon cyan border
         GradientDrawable gd = new GradientDrawable();
-        gd.setCornerRadius(dp(8));
-        gd.setColor(Color.parseColor("#E60B1218")); // Dark semi-transparent
+        gd.setCornerRadius(dp(10));
+        gd.setColor(Color.parseColor("#FF0E141B")); // 100% Solid Opaque
         gd.setStroke(dp(2), Color.parseColor("#00E5FF")); // Neon Cyan border
         hudPanelContainer.setBackground(gd);
-        hudPanelContainer.setAlpha((float) hudOpacity / 100.0f);
+        hudPanelContainer.setAlpha(1.0f); // 100% Opacity
 
-        // Header layout (Title + Status Badge)
+        // 1. Sleek Top Drag Handle Indicator Bar
+        LinearLayout handleContainer = new LinearLayout(context);
+        handleContainer.setGravity(Gravity.CENTER);
+        handleContainer.setPadding(0, dp(2), 0, dp(4));
+
+        View dragHandle = new View(context);
+        GradientDrawable handleGd = new GradientDrawable();
+        handleGd.setCornerRadius(dp(3));
+        handleGd.setColor(Color.parseColor("#8000E5FF")); // Neon pill
+        dragHandle.setBackground(handleGd);
+        LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(42), dp(4));
+        handleContainer.addView(dragHandle);
+
+        // 2. Header layout (Title + Status Badge)
         LinearLayout headerLayout = new LinearLayout(context);
         headerLayout.setOrientation(LinearLayout.HORIZONTAL);
         headerLayout.setGravity(Gravity.CENTER_VERTICAL);
-        headerLayout.setPadding(0, 0, 0, dp(4));
+        headerLayout.setPadding(0, dp(2), 0, dp(6));
 
         hudHeaderTitle = new TextView(context);
-        hudHeaderTitle.setText("⚡ STATUS PANEL");
+        hudHeaderTitle.setText("STATUS RADAR");
         hudHeaderTitle.setTextColor(Color.parseColor("#00E5FF"));
         hudHeaderTitle.setTypeface(Typeface.DEFAULT_BOLD);
-        hudHeaderTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, hudTextSize);
+        hudHeaderTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1.0f);
         hudHeaderTitle.setLayoutParams(titleLp);
 
@@ -1234,61 +1244,82 @@ public class Menu {
         headerLayout.addView(hudHeaderTitle);
         headerLayout.addView(hudStatusBadge);
 
-        // Content layout (Players, Bots, Total Alive)
+        // 3. Content layout (Summary row + Roster lists)
         hudContentContainer = new LinearLayout(context);
         hudContentContainer.setOrientation(LinearLayout.VERTICAL);
 
-        hudPlayersRow = new TextView(context);
-        hudPlayersRow.setTextColor(Color.WHITE);
-        hudPlayersRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, hudTextSize);
-        hudPlayersRow.setText(Html.fromHtml("👥 <b>PLAYERS:</b> <font color='#00E5FF'><b>0</b></font>"));
-        hudPlayersRow.setPadding(0, dp(2), 0, dp(2));
+        // Summary row: TEAM / ENEMIES / ALIVE
+        hudSummaryRow = new TextView(context);
+        hudSummaryRow.setTextColor(Color.WHITE);
+        hudSummaryRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        hudSummaryRow.setPadding(0, dp(2), 0, dp(6));
+        hudSummaryRow.setText(Html.fromHtml("<b>TEAM:</b> 0 | <b>ENEMIES:</b> 0 | <b>ALIVE:</b> 0"));
 
-        hudBotsRow = new TextView(context);
-        hudBotsRow.setTextColor(Color.WHITE);
-        hudBotsRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, hudTextSize);
-        hudBotsRow.setText(Html.fromHtml("🤖 <b>BOTS:</b>    <font color='#FF9100'><b>0</b></font>"));
-        hudBotsRow.setPadding(0, dp(2), 0, dp(2));
+        // Scrollable roster container for player & enemy usernames
+        hudRosterScroll = new ScrollView(context);
+        LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(dp(250), WRAP_CONTENT);
+        hudRosterScroll.setLayoutParams(scrollLp);
 
-        hudAliveRow = new TextView(context);
-        hudAliveRow.setTextColor(Color.WHITE);
-        hudAliveRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, hudTextSize + 1);
-        hudAliveRow.setText(Html.fromHtml("🟢 <b>ALIVE:</b>   <font color='#00E676'><b>0</b></font>"));
-        hudAliveRow.setPadding(0, dp(2), 0, dp(2));
+        LinearLayout rosterInner = new LinearLayout(context);
+        rosterInner.setOrientation(LinearLayout.VERTICAL);
 
-        hudContentContainer.addView(hudPlayersRow);
-        hudContentContainer.addView(hudBotsRow);
-        hudContentContainer.addView(hudAliveRow);
+        // Team section
+        hudTeamHeader = new TextView(context);
+        hudTeamHeader.setTextColor(Color.parseColor("#00E676"));
+        hudTeamHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        hudTeamHeader.setTypeface(Typeface.DEFAULT_BOLD);
+        hudTeamHeader.setText("[ALLIES / TEAM]");
+        hudTeamHeader.setPadding(0, dp(2), 0, dp(2));
+
+        hudTeamList = new TextView(context);
+        hudTeamList.setTextColor(Color.parseColor("#E0E0E0"));
+        hudTeamList.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        hudTeamList.setPadding(dp(4), 0, 0, dp(4));
+        hudTeamList.setText("Waiting for match roster...");
+
+        // Enemy section
+        hudEnemyHeader = new TextView(context);
+        hudEnemyHeader.setTextColor(Color.parseColor("#FF5252"));
+        hudEnemyHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        hudEnemyHeader.setTypeface(Typeface.DEFAULT_BOLD);
+        hudEnemyHeader.setText("[ENEMIES]");
+        hudEnemyHeader.setPadding(0, dp(2), 0, dp(2));
+
+        hudEnemyList = new TextView(context);
+        hudEnemyList.setTextColor(Color.parseColor("#E0E0E0"));
+        hudEnemyList.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        hudEnemyList.setPadding(dp(4), 0, 0, dp(4));
+        hudEnemyList.setText("Waiting for enemy roster...");
+
+        rosterInner.addView(hudTeamHeader);
+        rosterInner.addView(hudTeamList);
+        rosterInner.addView(hudEnemyHeader);
+        rosterInner.addView(hudEnemyList);
+        hudRosterScroll.addView(rosterInner);
+
+        hudContentContainer.addView(hudSummaryRow);
+        hudContentContainer.addView(hudRosterScroll);
 
         // Compact view (Pill mode when tapped)
         hudCompactText = new TextView(context);
         hudCompactText.setTextColor(Color.WHITE);
-        hudCompactText.setTextSize(TypedValue.COMPLEX_UNIT_SP, hudTextSize);
+        hudCompactText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         hudCompactText.setVisibility(View.GONE);
-        hudCompactText.setText(Html.fromHtml("👥 <b>P:</b> 0 | 🤖 <b>B:</b> 0 | 🟢 <b>A:</b> 0"));
+        hudCompactText.setText(Html.fromHtml("<b>T:</b> 0 | <b>E:</b> 0 | <b>A:</b> 0"));
 
+        hudPanelContainer.addView(handleContainer);
         hudPanelContainer.addView(headerLayout);
         hudPanelContainer.addView(hudContentContainer);
         hudPanelContainer.addView(hudCompactText);
 
         hudRootFrame.addView(hudPanelContainer);
 
-        // Tap header to toggle compact mode
-        headerLayout.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                isHudCompact = !isHudCompact;
-                hudContentContainer.setVisibility(isHudCompact ? View.GONE : View.VISIBLE);
-                hudCompactText.setVisibility(isHudCompact ? View.VISIBLE : View.GONE);
-                logToFile("HUD Panel mode changed: " + (isHudCompact ? "COMPACT" : "EXPANDED"));
-            }
-        });
-
-        // Touch Listener for Drag & Drop
+        // Flawless Touch Listener: Smooth Drag & Drop + Tap to compact
         hudPanelContainer.setOnTouchListener(new View.OnTouchListener() {
             private int initX, initY;
             private float touchX, touchY;
-            private boolean isDrag = false;
+            private boolean isDragging = false;
+            private final int touchSlop = dp(6);
 
             @Override
             public boolean onTouch(View v, MotionEvent event) {
@@ -1298,22 +1329,31 @@ public class Menu {
                         initY = hudParams.y;
                         touchX = event.getRawX();
                         touchY = event.getRawY();
-                        isDrag = false;
-                        return false;
+                        isDragging = false;
+                        return true; // Crucial for receiving move & up events!
                     case MotionEvent.ACTION_MOVE:
                         int dx = (int) (event.getRawX() - touchX);
                         int dy = (int) (event.getRawY() - touchY);
-                        if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
-                            isDrag = true;
+                        if (Math.abs(dx) > touchSlop || Math.abs(dy) > touchSlop) {
+                            isDragging = true;
                             hudParams.x = initX + dx;
                             hudParams.y = initY + dy;
-                            if (mWindowManager != null) {
-                                mWindowManager.updateViewLayout(hudRootFrame, hudParams);
+                            if (mWindowManager != null && hudRootFrame != null) {
+                                try {
+                                    mWindowManager.updateViewLayout(hudRootFrame, hudParams);
+                                } catch (Exception ignored) {}
                             }
                         }
                         return true;
                     case MotionEvent.ACTION_UP:
-                        return isDrag;
+                        if (!isDragging) {
+                            // Tap to toggle compact mode
+                            isHudCompact = !isHudCompact;
+                            hudContentContainer.setVisibility(isHudCompact ? View.GONE : View.VISIBLE);
+                            hudCompactText.setVisibility(isHudCompact ? View.VISIBLE : View.GONE);
+                            logToFile("HUD Panel mode changed: " + (isHudCompact ? "COMPACT" : "EXPANDED"));
+                        }
+                        return true;
                 }
                 return false;
             }
@@ -1335,7 +1375,7 @@ public class Menu {
             }
         };
 
-        logToFile("HUD Status Panel initialized successfully.");
+        logToFile("HUD Status Panel initialized successfully (Default: OFF, Pos: Top-Center, Opacity: 100%).");
     }
 
     private void updateHudStatus() {
@@ -1343,36 +1383,33 @@ public class Menu {
             return;
         }
 
-        String rawStatus;
+        String rawStatus = "";
         try {
             rawStatus = GetHudStatus();
         } catch (UnsatisfiedLinkError e) {
             return;
         }
 
-        if (rawStatus == null || rawStatus.isEmpty()) {
-            return;
-        }
-
-        // Parse PLAYERS:%d|BOTS:%d|ALIVE:%d|STATUS:%s|ENABLED:%d|SHOW_BOT:%d|SHOW_PLAYER:%d|OPACITY:%d|TEXT_SIZE:%d
         int players = 0, bots = 0, alive = 0;
         String status = "STANDBY";
         boolean inBattle = false;
 
-        String[] parts = rawStatus.split("\\|");
-        for (String part : parts) {
-            String[] kv = part.split(":");
-            if (kv.length == 2) {
-                String key = kv[0];
-                String val = kv[1];
-                if ("PLAYERS".equals(key)) {
-                    try { players = Integer.parseInt(val); } catch (Exception ignored) {}
-                } else if ("BOTS".equals(key)) {
-                    try { bots = Integer.parseInt(val); } catch (Exception ignored) {}
-                } else if ("ALIVE".equals(key)) {
-                    try { alive = Integer.parseInt(val); } catch (Exception ignored) {}
-                } else if ("STATUS".equals(key)) {
-                    status = val;
+        if (rawStatus != null && !rawStatus.isEmpty()) {
+            String[] parts = rawStatus.split("\\|");
+            for (String part : parts) {
+                String[] kv = part.split(":");
+                if (kv.length == 2) {
+                    String key = kv[0];
+                    String val = kv[1];
+                    if ("PLAYERS".equals(key)) {
+                        try { players = Integer.parseInt(val); } catch (Exception ignored) {}
+                    } else if ("BOTS".equals(key)) {
+                        try { bots = Integer.parseInt(val); } catch (Exception ignored) {}
+                    } else if ("ALIVE".equals(key)) {
+                        try { alive = Integer.parseInt(val); } catch (Exception ignored) {}
+                    } else if ("STATUS".equals(key)) {
+                        status = val;
+                    }
                 }
             }
         }
@@ -1381,45 +1418,89 @@ public class Menu {
 
         // Update status badge
         if (hudStatusBadge != null) {
-            hudStatusBadge.setText(" " + (inBattle ? "🟢 IN-BATTLE" : "🟡 LOBBY") + " ");
+            hudStatusBadge.setText(" " + (inBattle ? "[IN-BATTLE]" : "[LOBBY]") + " ");
             GradientDrawable badgeGd = new GradientDrawable();
             badgeGd.setCornerRadius(dp(4));
             badgeGd.setColor(inBattle ? Color.parseColor("#1B5E20") : Color.parseColor("#37474F"));
             hudStatusBadge.setBackground(badgeGd);
         }
 
-        if (hudPlayersRow != null) {
-            hudPlayersRow.setText(Html.fromHtml("👥 <b>PLAYERS:</b> <font color='#00E5FF'><b>" + players + "</b></font>"));
-            hudPlayersRow.setVisibility(showPlayerCount ? View.VISIBLE : View.GONE);
+        // Fetch team & enemy roster with username
+        String rawRoster = "";
+        try {
+            rawRoster = GetHudRoster();
+        } catch (UnsatisfiedLinkError ignored) {}
+
+        int teamCount = 0;
+        int enemyCount = 0;
+        StringBuilder teamSb = new StringBuilder();
+        StringBuilder enemySb = new StringBuilder();
+
+        if (rawRoster != null && rawRoster.contains("|")) {
+            String[] rParts = rawRoster.split("\\|");
+            for (String rp : rParts) {
+                if (rp.startsWith("TEAM:")) {
+                    String list = rp.substring(5);
+                    if (!list.isEmpty()) {
+                        String[] members = list.split(",");
+                        for (String m : members) {
+                            teamCount++;
+                            teamSb.append(formatRosterEntry(m, true)).append("<br>");
+                        }
+                    }
+                } else if (rp.startsWith("ENEMY:")) {
+                    String list = rp.substring(6);
+                    if (!list.isEmpty()) {
+                        String[] members = list.split(",");
+                        for (String m : members) {
+                            enemyCount++;
+                            enemySb.append(formatRosterEntry(m, false)).append("<br>");
+                        }
+                    }
+                }
+            }
         }
-        if (hudBotsRow != null) {
-            hudBotsRow.setText(Html.fromHtml("🤖 <b>BOTS:</b>    <font color='#FF9100'><b>" + bots + "</b></font>"));
-            hudBotsRow.setVisibility(showBotCount ? View.VISIBLE : View.GONE);
+
+        if (teamCount == 0 && teamSb.length() == 0) {
+            teamSb.append("<font color='#78909C'><i>Lobby / Waiting for match...</i></font>");
         }
-        if (hudAliveRow != null) {
-            hudAliveRow.setText(Html.fromHtml("🟢 <b>TOTAL ALIVE:</b> <font color='#00E676'><b>" + alive + "</b></font>"));
+        if (enemyCount == 0 && enemySb.length() == 0) {
+            enemySb.append("<font color='#78909C'><i>No enemy data available</i></font>");
         }
+
+        if (hudSummaryRow != null) {
+            hudSummaryRow.setText(Html.fromHtml("<b>TEAM:</b> <font color='#00E676'><b>" + teamCount + "</b></font> | <b>ENEMIES:</b> <font color='#FF5252'><b>" + enemyCount + "</b></font> | <b>ALIVE:</b> <font color='#00E5FF'><b>" + alive + "</b></font>"));
+        }
+
+        if (hudTeamList != null) {
+            hudTeamList.setText(Html.fromHtml(teamSb.toString()));
+        }
+        if (hudEnemyList != null) {
+            hudEnemyList.setText(Html.fromHtml(enemySb.toString()));
+        }
+
         if (hudCompactText != null) {
-            hudCompactText.setText(Html.fromHtml("👥 <b>P:</b> " + players + " | 🤖 <b>B:</b> " + bots + " | 🟢 <b>A:</b> " + alive));
+            hudCompactText.setText(Html.fromHtml("<b>T:</b> " + teamCount + " | <b>E:</b> " + enemyCount + " | <b>A:</b> " + alive));
         }
     }
 
-    private void applyHudTextSize(int sp) {
-        if (hudHeaderTitle != null) {
-            hudHeaderTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+    private String formatRosterEntry(String entry, boolean isAlly) {
+        // Format: Name(Hero)[P] or Name(Hero)[B]
+        boolean isReal = entry.endsWith("[P]");
+        String clean = entry.replace("[P]", "").replace("[B]", "");
+        String name = clean;
+        String hero = "";
+        int paren = clean.indexOf('(');
+        if (paren != -1 && clean.endsWith(")")) {
+            name = clean.substring(0, paren);
+            hero = clean.substring(paren + 1, clean.length() - 1);
         }
-        if (hudPlayersRow != null) {
-            hudPlayersRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
-        }
-        if (hudBotsRow != null) {
-            hudBotsRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
-        }
-        if (hudAliveRow != null) {
-            hudAliveRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp + 1);
-        }
-        if (hudCompactText != null) {
-            hudCompactText.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
-        }
+
+        String dot = isAlly ? "<font color='#00E676'>&#9679;</font>" : "<font color='#FF5252'>&#9679;</font>";
+        String tag = isReal ? "<font color='#00E5FF'>[PLAYER]</font>" : "<font color='#FFA726'>[BOT]</font>";
+        String heroStr = hero.isEmpty() ? "" : " <font color='#90A4AE'>(" + hero + ")</font>";
+
+        return dot + " <b>" + name + "</b>" + heroStr + " " + tag;
     }
 
     public static void logToFile(String msg) {
