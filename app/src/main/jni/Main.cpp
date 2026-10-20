@@ -36,6 +36,7 @@ static std::atomic<bool>  g_LocalPlayerAlive{false};
 static std::atomic<bool>  g_FullBright{false};
 static std::atomic<bool>  g_CameraZoomOut{false};
 static std::atomic<float> g_ZoomFactor{1.6f}; // Default 1.6x zoom factor
+static std::atomic<bool>  g_MaxWeaponRange{false}; // OFF by default
 
 static bool g_HudStatusPanelEnabled = false; // OFF by default
 
@@ -43,11 +44,15 @@ static bool g_HudStatusPanelEnabled = false; // OFF by default
 static void* g_MatchData = nullptr;
 static void* g_AliveUnitsCounterInstance = nullptr;
 static void* g_CameraInstance = nullptr;
-static float g_OriginalCameraSize[2] = { 250.0f, 250.0f };
+static float g_VanillaCameraZoom = 1.0f;
 
 // Hero vision config caches for real-time Full Bright toggle
 static std::vector<void*> g_VisionConfigs;
 static std::mutex g_VisionMutex;
+
+// Weapon config caches for real-time Max Weapon Range toggle
+static std::vector<void*> g_WeaponConfigs;
+static std::mutex g_WeaponMutex;
 
 // Participant entry cached from MatchData
 struct ParticipantInfo {
@@ -79,8 +84,8 @@ static std::atomic<bool> g_PatchesInitialized{false};
 // 8. 0x30aec60: Function MainMenuScreen::setup - triggers when entering main menu / lobby
 // 9. 0x114054c: DarknessRTT::render - main darkness render pass
 // 10. 0x1142af4: DarknessRTT::renderShadows - lightSectorRTT/lightScreenRTT pass
-// 11. 0x1b96140: CameraView::setSize(Vector2 size) - camera frustum setter
-// 12. 0x3563b30: Padding trampoline in libbulletecho.so for camera hook
+// 11. 0x31d0594: Camera::setZoom(void *camera, float zoom) - real-time camera zoom setter
+// 12. 0x265f52c: WeaponConfigLoader(void *outStruct, void *cfg) - weapon flight & distance loader
 // ============================================================================
 #define OFFSET_ALIVE_UNITS_SETUP    "0x1bcadcc"
 #define OFFSET_ALIVE_UNITS_UPDATE   "0x1bcb3cc"
@@ -92,7 +97,8 @@ static std::atomic<bool> g_PatchesInitialized{false};
 #define OFFSET_MAIN_MENU            "0x30aec60"
 #define OFFSET_DARKNESS_RENDER      "0x114054c"
 #define OFFSET_DARKNESS_SHADOWS     "0x1142af4"
-#define OFFSET_CAMERA_SET_SIZE      "0x1b96140"
+#define OFFSET_CAMERA_SET_ZOOM      "0x31d0594"
+#define OFFSET_WEAPON_CONFIG_LOADER "0x265f52c"
 
 // Original function pointers
 static void *(*orig_alive_units_setup)(void *instance) = nullptr;
@@ -103,7 +109,8 @@ static void  (*orig_player_died)(void *instance, int32_t reason, void *extra) = 
 static void  (*orig_match_finished)(void *instance, void *evt) = nullptr;
 static void  (*orig_leave_match)(void *instance, void *evt) = nullptr;
 static void *(*orig_main_menu)(void *instance) = nullptr;
-static void  (*orig_camera_set_size)(void *camera, float *size) = nullptr;
+static void  (*orig_camera_set_zoom)(void *camera, float zoom) = nullptr;
+static void *(*orig_weapon_config_loader)(void *outStruct, void *cfg) = nullptr;
 
 // Helper: Safely decode libc++ std::string in ARM64 memory
 static std::string ReadStdString(uintptr_t strPtr) {
@@ -324,28 +331,102 @@ void *hook_main_menu(void *instance) {
     return instance;
 }
 
-// Hook 9: Camera Zoom Handler (called from 0x1b96140 trampoline and callsites)
-void hook_camera_set_size(void *camera, float *size) {
-    if (!camera) return;
-    g_CameraInstance = camera;
-    if (size) {
-        if (size[0] > 10.0f && size[1] > 10.0f) {
-            g_OriginalCameraSize[0] = size[0];
-            g_OriginalCameraSize[1] = size[1];
-        }
+// Helper: recursively update flyDistance in std::map<int32_t, float> red-black tree
+static void UpdateMapFlyDistance(uintptr_t node, float newDist) {
+    if (!node) return;
+    *(float*)(node + 0x20) = newDist;
+    uintptr_t left = *(uintptr_t*)(node + 0x00);
+    uintptr_t right = *(uintptr_t*)(node + 0x08);
+    if (left && left != node) {
+        UpdateMapFlyDistance(left, newDist);
+    }
+    if (right && right != node) {
+        UpdateMapFlyDistance(right, newDist);
+    }
+}
+
+// Apply Max Weapon Range parameters to a single WeaponConfig structure
+static void ApplyWeaponConfigRange(void *res, bool enable) {
+    if (!res) return;
+    uintptr_t cfg = (uintptr_t)res;
+    float dist = enable ? 10000.0f : 200.0f;
+    float dur  = enable ? 50.0f : 2.0f;
+
+    *(float*)(cfg + 0x38) = dist; // default flyDistance (normally 200m)
+    *(float*)(cfg + 0x04) = dur;  // flyDuration (normally 2s)
+    if (enable) {
+        *(float*)(cfg + 0x00) = 0.0f; // flySpread: pinpoint laser accuracy (0 spread)
     }
 
-    float finalSize[2] = { g_OriginalCameraSize[0], g_OriginalCameraSize[1] };
+    // Traverse flyDistanceByLevel red-black tree (root pointer at +0x28)
+    uintptr_t root = *(uintptr_t*)(cfg + 0x28);
+    if (root) {
+        UpdateMapFlyDistance(root, dist);
+    }
+}
+
+// Real-time batch toggle across all cached weapon configs in memory
+static void ApplyMaxWeaponRange(bool enable) {
+    std::lock_guard<std::mutex> lock(g_WeaponMutex);
+    for (void *cfg : g_WeaponConfigs) {
+        if (cfg) {
+            ApplyWeaponConfigRange(cfg, enable);
+        }
+    }
+    LOGI("[WeaponRange] %s applied across %zu weapon configs (FlyDist: %.1fm, FlyDur: %.1fs)",
+         enable ? "MAX WEAPON RANGE ENABLED" : "RESTORED VANILLA",
+         enable ? 10000.0f : 200.0f,
+         enable ? 50.0f : 2.0f,
+         g_WeaponConfigs.size());
+}
+
+// Hook 9: Real-time Camera Zoom Handler (0x31d0594: Camera::setZoom(void *camera, float zoom))
+// Called every frame by CameraPresenterSystem (0x1bdb978, 0x1bdbae0, 0x1bdbb38)
+void hook_camera_set_zoom(void *camera, float zoom) {
+    if (!camera) return;
+    g_CameraInstance = camera;
+
+    if (zoom > 0.001f && zoom < 100.0f) {
+        g_VanillaCameraZoom = zoom;
+    }
+
+    float finalZoom = zoom;
     if (g_CameraZoomOut.load()) {
         float factor = g_ZoomFactor.load();
         if (factor < 1.0f) factor = 1.0f;
         if (factor > 3.0f) factor = 3.0f;
-        finalSize[0] *= factor;
-        finalSize[1] *= factor;
+        finalZoom = zoom * factor;
     }
 
-    // Original logic of 0x1b96140: store width, height to [camera + 0x88]
-    *(uint64_t*)((uintptr_t)camera + 0x88) = *(uint64_t*)finalSize;
+    if (orig_camera_set_zoom) {
+        orig_camera_set_zoom(camera, finalZoom);
+    } else {
+        float curZoom = *(float*)((uintptr_t)camera + 0xcc);
+        if (curZoom != finalZoom) {
+            *(float*)((uintptr_t)camera + 0xcc) = finalZoom;
+            *(uint32_t*)((uintptr_t)camera + 0x88) = 3; // dirty flag
+        }
+    }
+}
+
+// Hook 10: Weapon Config Loader (0x265f52c: loads bullet flyDistance, flyDuration, flySpread)
+void *hook_weapon_config_loader(void *outStruct, void *cfg) {
+    void *res = outStruct;
+    if (orig_weapon_config_loader) {
+        res = orig_weapon_config_loader(outStruct, cfg);
+    }
+    if (res) {
+        {
+            std::lock_guard<std::mutex> lock(g_WeaponMutex);
+            if (std::find(g_WeaponConfigs.begin(), g_WeaponConfigs.end(), res) == g_WeaponConfigs.end()) {
+                g_WeaponConfigs.push_back(res);
+            }
+        }
+        if (g_MaxWeaponRange.load()) {
+            ApplyWeaponConfigRange(res, true);
+        }
+    }
+    return res;
 }
 
 // Apply Full Bright memory patches (bypasses DarknessRTT passes: 0x114054c & 0x1142af4)
@@ -371,55 +452,6 @@ static void ApplyFullBright(bool enable) {
     }
     LOGI("[FullBright] %s (Darkness bypass & %.1fm vision across %zu hero configs)",
          enable ? "ENABLED" : "DISABLED", targetRadius, g_VisionConfigs.size());
-}
-
-// Install Camera Zoom Out trampoline hook
-static void InstallCameraZoomHook(uintptr_t base) {
-    uintptr_t trampoline = base + 0x3563b30;
-    long pageSize = sysconf(_SC_PAGESIZE);
-
-    // 1. Unprotect trampoline page and write 64-bit jump to hook_camera_set_size
-    uintptr_t page1 = trampoline & ~(pageSize - 1);
-    mprotect((void*)page1, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
-
-    uint32_t *tCode = (uint32_t*)trampoline;
-    tCode[0] = 0x58000050; // ldr x16, [pc, #8]
-    tCode[1] = 0xd61f0200; // br x16
-    *(uint64_t*)(trampoline + 8) = (uint64_t)&hook_camera_set_size;
-
-    // 2. Patch CameraView::setSize entry (0x1b96140) with direct branch B trampoline: 0x1467367c
-    uintptr_t targetFunc = base + 0x1b96140;
-    uintptr_t pageFunc = targetFunc & ~(pageSize - 1);
-    mprotect((void*)pageFunc, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
-    *(uint32_t*)targetFunc = 0x1467367c; // B 0x3563b30
-
-    // 3. Patch callsites with BL trampoline:
-    // ViewManager setupLevel callsite (0x1b8273c)
-    uintptr_t call1 = base + 0x1b8273c;
-    uintptr_t pageCall1 = call1 & ~(pageSize - 1);
-    mprotect((void*)pageCall1, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
-    *(uint32_t*)call1 = 0x946784fd; // BL 0x3563b30
-
-    // WeatherPresenterSystem update callsite (0x23a6998)
-    uintptr_t call2 = base + 0x23a6998;
-    uintptr_t pageCall2 = call2 & ~(pageSize - 1);
-    mprotect((void*)pageCall2, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
-    *(uint32_t*)call2 = 0x9446f466; // BL 0x3563b30
-
-    // Debug menu callsite (0x1bfc2c4)
-    uintptr_t call3 = base + 0x1bfc2c4;
-    uintptr_t pageCall3 = call3 & ~(pageSize - 1);
-    mprotect((void*)pageCall3, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
-    *(uint32_t*)call3 = 0x94659e1b; // BL 0x3563b30
-
-    // Flush CPU cache
-    __builtin___clear_cache((char*)page1, (char*)page1 + pageSize * 2);
-    __builtin___clear_cache((char*)pageFunc, (char*)pageFunc + pageSize * 2);
-    __builtin___clear_cache((char*)pageCall1, (char*)pageCall1 + pageSize * 2);
-    __builtin___clear_cache((char*)pageCall2, (char*)pageCall2 + pageSize * 2);
-    __builtin___clear_cache((char*)pageCall3, (char*)pageCall3 + pageSize * 2);
-
-    LOGI("[OK] Camera Zoom Out Hooks installed across entry (0x1b96140) and callsites (0x1b8273c, 0x23a6998, 0x1bfc2c4) -> Tramp 0x3563b30");
 }
 
 // Native hook thread
@@ -511,10 +543,21 @@ void *hack_thread(void *) {
     g_PatchesInitialized.store(true);
     LOGI("[OK] Full Bright DarknessRTT Memory Patches prepared (0x114054c & 0x1142af4)");
 
-    // 10. Install Camera Zoom Out Hooks across CameraView::setSize and callsites
-    InstallCameraZoomHook(base);
+    // 10. Hook Weapon Config Loader (0x265f52c - Max Weapon Range cross-map)
+    uintptr_t addrWeaponConfig = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_WEAPON_CONFIG_LOADER));
+    if (addrWeaponConfig) {
+        HOOK(OFFSET_WEAPON_CONFIG_LOADER, hook_weapon_config_loader, orig_weapon_config_loader);
+        LOGI("[OK] Hooked Weapon Config Loader at 0x%lx", addrWeaponConfig);
+    }
 
-    LOGI("All HUD, Full Bright, and Camera Zoom modifications installed successfully!");
+    // 11. Hook Camera::setZoom (0x31d0594 - Real-time Camera Zoom Out)
+    uintptr_t addrCameraZoom = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_CAMERA_SET_ZOOM));
+    if (addrCameraZoom) {
+        HOOK(OFFSET_CAMERA_SET_ZOOM, hook_camera_set_zoom, orig_camera_set_zoom);
+        LOGI("[OK] Hooked Camera::setZoom at 0x%lx", addrCameraZoom);
+    }
+
+    LOGI("All HUD, Full Bright, Camera Zoom, and Max Weapon Range modifications installed successfully!");
 #else
     LOGW("Target is 64-bit arm64-v8a. Non-arm64 compilation skipped.");
 #endif
@@ -532,6 +575,8 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("1_Toggle_Full Bright"),        // OFF by default
             OBFUSCATE("2_Toggle_Camera Zoom Out"),    // OFF by default
             OBFUSCATE("3_SeekBar_Zoom Level_10_30"),  // 10 = 1.0x, 30 = 3.0x, default 16 (1.6x)
+            OBFUSCATE("Category_Combat & Weapons"),
+            OBFUSCATE("4_Toggle_Max Weapon Range"),   // OFF by default
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -569,9 +614,13 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
         case 2: // Camera Zoom Out Toggle
             g_CameraZoomOut.store(boolean);
             if (g_CameraInstance) {
-                float factor = boolean ? g_ZoomFactor.load() : 1.0f;
-                float finalSize[2] = { g_OriginalCameraSize[0] * factor, g_OriginalCameraSize[1] * factor };
-                *(uint64_t*)((uintptr_t)g_CameraInstance + 0x88) = *(uint64_t*)finalSize;
+                float targetZoom = g_VanillaCameraZoom * (boolean ? g_ZoomFactor.load() : 1.0f);
+                if (orig_camera_set_zoom) {
+                    orig_camera_set_zoom(g_CameraInstance, targetZoom);
+                } else {
+                    *(float*)((uintptr_t)g_CameraInstance + 0xcc) = targetZoom;
+                    *(uint32_t*)((uintptr_t)g_CameraInstance + 0x88) = 3;
+                }
             }
             LOGI("Camera Zoom Out toggled: %s (Factor: %.1fx)", boolean ? "ENABLED" : "DISABLED", g_ZoomFactor.load());
             break;
@@ -582,11 +631,21 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
                 if (factor > 3.0f) factor = 3.0f;
                 g_ZoomFactor.store(factor);
                 if (g_CameraInstance && g_CameraZoomOut.load()) {
-                    float finalSize[2] = { g_OriginalCameraSize[0] * factor, g_OriginalCameraSize[1] * factor };
-                    *(uint64_t*)((uintptr_t)g_CameraInstance + 0x88) = *(uint64_t*)finalSize;
+                    float targetZoom = g_VanillaCameraZoom * factor;
+                    if (orig_camera_set_zoom) {
+                        orig_camera_set_zoom(g_CameraInstance, targetZoom);
+                    } else {
+                        *(float*)((uintptr_t)g_CameraInstance + 0xcc) = targetZoom;
+                        *(uint32_t*)((uintptr_t)g_CameraInstance + 0x88) = 3;
+                    }
                 }
                 LOGI("Zoom Level set: %d -> %.1fx", value, factor);
             }
+            break;
+        case 4: // Max Weapon Range Toggle
+            g_MaxWeaponRange.store(boolean);
+            ApplyMaxWeaponRange(boolean);
+            LOGI("Max Weapon Range toggled: %s (Cross-map infinite bullet range)", boolean ? "ENABLED" : "DISABLED");
             break;
         default:
             break;

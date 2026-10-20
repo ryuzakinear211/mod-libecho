@@ -658,6 +658,9 @@ public class Menu {
                     case 2: // Camera Zoom Out toggle
                         logToFile("Camera Zoom Out toggled: " + (bool ? "ON" : "OFF"));
                         break;
+                    case 4: // Max Weapon Range toggle
+                        logToFile("Max Weapon Range toggled: " + (bool ? "ON" : "OFF"));
+                        break;
                 }
             }
         });
