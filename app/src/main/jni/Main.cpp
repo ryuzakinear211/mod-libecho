@@ -58,6 +58,14 @@ static std::mutex g_VisionMutex;
 static MemoryPatch g_PatchWeaponRange1;
 static MemoryPatch g_PatchWeaponRange2;
 
+// Show Position Memory Patches (culling bypass in UnitPresenterSystem & MarkersPresenterSystem)
+// 1. 0x23d7c78: UnitPresenterSystem model visibility check (mov w23, #1 -> "37 00 80 52")
+// 2. 0x23d8b34: UnitPresenterSystem UI/healthbar visibility check (mov w9, #1 -> "29 00 80 52")
+// 3. 0x167df34: MarkersPresenterSystem map/screen marker check (mov w8, #1 -> "28 00 80 52")
+static MemoryPatch g_PatchShowPos1;
+static MemoryPatch g_PatchShowPos2;
+static MemoryPatch g_PatchShowPos3;
+
 // Participant entry cached from MatchData
 struct ParticipantInfo {
     uint32_t playerId;
@@ -105,7 +113,11 @@ static std::atomic<bool> g_PatchesInitialized{false};
 #define OFFSET_WEAPON_RANGE_PATCH1  "0x265f564"
 #define OFFSET_WEAPON_RANGE_PATCH2  "0x265fe38"
 #define OFFSET_IS_INSIDE_SECTOR     "0x166f8bc"
-#define OFFSET_VISION_IS_VISIBLE    "0x139d6dc"
+#define OFFSET_IS_INSIDE_SECTOR2    "0x166fed8"
+#define OFFSET_IS_POLYGON_INSIDE_SEC "0x166f3c0"
+#define OFFSET_SHOW_POS_PATCH1      "0x23d7c78"
+#define OFFSET_SHOW_POS_PATCH2      "0x23d8b34"
+#define OFFSET_SHOW_POS_PATCH3      "0x167df34"
 
 // Original function pointers
 static void *(*orig_alive_units_setup)(void *instance) = nullptr;
@@ -118,9 +130,8 @@ static void  (*orig_leave_match)(void *instance, void *evt) = nullptr;
 static void *(*orig_main_menu)(void *instance) = nullptr;
 static void  (*orig_camera_set_zoom)(void *camera, float zoom) = nullptr;
 static bool  (*orig_is_inside_sector)(void *sector, void *targetPos, float targetRadius) = nullptr;
-static void *(*orig_vision_is_visible)(void *visionContext, uint32_t targetId, int32_t extra) = nullptr;
-
-static uint8_t s_AlwaysVisibleBuffer[256];
+static bool  (*orig_is_inside_sector2)(void *sector, void *targetPos, void *targetSize) = nullptr;
+static bool  (*orig_is_polygon_inside_sec)(void *sector, void *polyVec) = nullptr;
 
 // Helper: Safely decode libc++ std::string in ARM64 memory
 static std::string ReadStdString(uintptr_t strPtr) {
@@ -271,6 +282,7 @@ void hook_alive_units_update(void *view, int32_t aliveCount, int32_t teamCount) 
 // Forward declarations
 static void UpdateActiveHeroWeaponRange(bool enable);
 static void UpdateActiveHeroPositionScan(bool enable);
+static void ApplyShowPosition(bool enable);
 
 // Hook 3: Battle Started event (populates real participant list at match start)
 void hook_battle_started(void *matchData, void *msg) {
@@ -293,7 +305,7 @@ void hook_battle_started(void *matchData, void *msg) {
         UpdateActiveHeroWeaponRange(true);
     }
     if (g_ShowPosition.load()) {
-        UpdateActiveHeroPositionScan(true);
+        ApplyShowPosition(true);
     }
 }
 
@@ -309,7 +321,7 @@ void hook_vision_radius_loader(void *outStruct, void *cfg) {
                 g_VisionConfigs.push_back(outStruct);
             }
         }
-        if (g_FullBright.load()) {
+        if (g_FullBright.load() || g_ShowPosition.load()) {
             *(float*)((uintptr_t)outStruct + 0x20) = 500.0f; // 500m full map vision range
         }
     }
@@ -367,21 +379,58 @@ static bool IsSafeMemory(const void *addr, size_t len) {
     return ok;
 }
 
-// Safely update active local player weapon range in-match directly from PlayerManager singleton
-static void UpdateActiveHeroWeaponRange(bool enable) {
+// Safely obtain active local HeroConfig in-match without crashes
+static uintptr_t GetActiveHeroConfigSafe() {
     uintptr_t libBase = (uintptr_t)getAbsoluteAddress(targetLibName, 0);
-    if (!libBase) return;
+    if (!libBase) return 0;
 
+    // Strategy 1: Read via engine PlayerManager chain (0x3711f70 -> 0x37119c0)
+    uintptr_t* pGlobal = (uintptr_t*)(libBase + 0x3711f70);
+    if (IsSafeMemory(pGlobal, sizeof(uintptr_t))) {
+        uintptr_t globalObj = *pGlobal;
+        if (globalObj && IsSafeMemory((void*)(globalObj + 8), sizeof(uintptr_t))) {
+            uintptr_t arr = *(uintptr_t*)(globalObj + 8);
+            uint32_t* pIdx = (uint32_t*)(libBase + 0x37119c0);
+            if (IsSafeMemory(pIdx, sizeof(uint32_t))) {
+                uint32_t idx = *pIdx;
+                uintptr_t elemSlot = arr + ((uintptr_t)idx << 4);
+                if (IsSafeMemory((void*)elemSlot, sizeof(uintptr_t))) {
+                    uintptr_t elem = *(uintptr_t*)elemSlot;
+                    if (elem && IsSafeMemory((void*)(elem + 0x18), sizeof(uintptr_t))) {
+                        uintptr_t playerMgr = *(uintptr_t*)(elem + 0x18);
+                        if (playerMgr && IsSafeMemory((void*)(playerMgr + 0xa0), sizeof(uintptr_t))) {
+                            uintptr_t heroConfig = *(uintptr_t*)(playerMgr + 0xa0);
+                            if (heroConfig && IsSafeMemory((void*)heroConfig, 0x300)) {
+                                return heroConfig;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Singleton slot at 0x375cc70 + 0x1a18
     void *managerSlot = (void*)(libBase + 0x375cc70);
-    if (!IsSafeMemory(managerSlot, sizeof(void*))) return;
+    if (IsSafeMemory(managerSlot, sizeof(void*))) {
+        uintptr_t manager = *(uintptr_t*)managerSlot;
+        if (manager) {
+            void *configSlot = (void*)(manager + 0x1a18);
+            if (IsSafeMemory(configSlot, sizeof(void*))) {
+                uintptr_t heroConfig = *(uintptr_t*)configSlot;
+                if (heroConfig && IsSafeMemory((void*)heroConfig, 0x300)) {
+                    return heroConfig;
+                }
+            }
+        }
+    }
 
-    uintptr_t manager = *(uintptr_t*)managerSlot;
-    if (!manager) return;
+    return 0;
+}
 
-    void *configSlot = (void*)(manager + 0x1a18);
-    if (!IsSafeMemory(configSlot, sizeof(void*))) return;
-
-    uintptr_t heroConfig = *(uintptr_t*)configSlot;
+// Safely update active local player weapon range in-match
+static void UpdateActiveHeroWeaponRange(bool enable) {
+    uintptr_t heroConfig = GetActiveHeroConfigSafe();
     if (!heroConfig) return;
 
     void *flyDistSlot = (void*)(heroConfig + 0x240);
@@ -399,19 +448,7 @@ static void UpdateActiveHeroWeaponRange(bool enable) {
 
 // Safely update active hero scan and wallhack configs for Show Position in-match
 static void UpdateActiveHeroPositionScan(bool enable) {
-    uintptr_t libBase = (uintptr_t)getAbsoluteAddress(targetLibName, 0);
-    if (!libBase) return;
-
-    void *managerSlot = (void*)(libBase + 0x375cc70);
-    if (!IsSafeMemory(managerSlot, sizeof(void*))) return;
-
-    uintptr_t manager = *(uintptr_t*)managerSlot;
-    if (!manager) return;
-
-    void *configSlot = (void*)(manager + 0x1a18);
-    if (!IsSafeMemory(configSlot, sizeof(void*))) return;
-
-    uintptr_t heroConfig = *(uintptr_t*)configSlot;
+    uintptr_t heroConfig = GetActiveHeroConfigSafe();
     if (!heroConfig) return;
 
     void *scanSlot = (void*)(heroConfig + 0x110);
@@ -429,11 +466,48 @@ static void UpdateActiveHeroPositionScan(bool enable) {
         *(float*)(heroConfig + 0x128) = 50.0f;   // default warningAudibleRadius
     }
 
+    // Also update heroConfig + 0x40 (VisionConfig*)
+    if (IsSafeMemory((void*)(heroConfig + 0x40), sizeof(void*))) {
+        uintptr_t visionConfig = *(uintptr_t*)(heroConfig + 0x40);
+        if (visionConfig && IsSafeMemory((void*)(visionConfig + 0x20), sizeof(float))) {
+            *(float*)(visionConfig + 0x20) = (enable || g_FullBright.load()) ? 500.0f : 100.0f;
+        }
+    }
+
     LOGI("[ShowPosition] Real-time active hero scan config updated: enable=%d (HeroConfig=%p)",
          enable ? 1 : 0, (void*)heroConfig);
 }
 
-// Hook: IsInsideSector (0x166f8bc: bool IsInsideSector(void *sector, void *targetPos, float targetRadius))
+// Apply Show Position memory patches (bypasses unit presenter & markers culling)
+static void ApplyShowPosition(bool enable) {
+    if (g_PatchShowPos1.isValid()) {
+        if (enable) g_PatchShowPos1.Modify();
+        else g_PatchShowPos1.Restore();
+    }
+    if (g_PatchShowPos2.isValid()) {
+        if (enable) g_PatchShowPos2.Modify();
+        else g_PatchShowPos2.Restore();
+    }
+    if (g_PatchShowPos3.isValid()) {
+        if (enable) g_PatchShowPos3.Modify();
+        else g_PatchShowPos3.Restore();
+    }
+
+    float targetRadius = (enable || g_FullBright.load()) ? 500.0f : 100.0f;
+    {
+        std::lock_guard<std::mutex> lock(g_VisionMutex);
+        for (void *cfg : g_VisionConfigs) {
+            if (cfg) {
+                *(float*)((uintptr_t)cfg + 0x20) = targetRadius;
+            }
+        }
+    }
+
+    UpdateActiveHeroPositionScan(enable);
+    LOGI("[ShowPosition] %s (Unit presenter & markers culling bypass)", enable ? "ENABLED" : "DISABLED");
+}
+
+// Hook 12a: IsInsideSector (0x166f8bc - single sector cone check)
 // Called by ShootTriggerSystem (0x21f4c58) and VisionSystem (0x21ed8fc, 0x21ed914)
 bool hook_is_inside_sector(void *sector, void *targetPos, float targetRadius) {
     if (!sector || (uintptr_t)sector < 0x10000) {
@@ -446,9 +520,9 @@ bool hook_is_inside_sector(void *sector, void *targetPos, float targetRadius) {
 
     bool modified = false;
     if (g_WideLaser.load()) {
-        // Expand laser detection cone to ~48.7 degrees (0.85 rad, or ±24.3 degrees around laser line)
-        if (origAngle < 0.85f) {
-            *(float*)((uintptr_t)sector + 0x18) = 0.85f;
+        // Expand laser detection cone to ~68.8 degrees (1.2 rad, ±34.4 degrees around laser line)
+        if (origAngle < 1.2f) {
+            *(float*)((uintptr_t)sector + 0x18) = 1.2f;
             modified = true;
         }
     }
@@ -460,8 +534,8 @@ bool hook_is_inside_sector(void *sector, void *targetPos, float targetRadius) {
     }
 
     float effectiveRadius = targetRadius;
-    if (g_WideLaser.load() && effectiveRadius < 1.5f) {
-        effectiveRadius = 1.5f;
+    if (g_WideLaser.load() && effectiveRadius < 2.0f) {
+        effectiveRadius = 2.0f;
     }
 
     bool result = false;
@@ -477,26 +551,82 @@ bool hook_is_inside_sector(void *sector, void *targetPos, float targetRadius) {
     return result;
 }
 
-// Hook: VisionMethods::isVisible (0x139d6dc: void *isVisible(void *visionContext, uint32_t targetId, int32_t extra))
-// Called by MarkersPresenterSystem (0x167df30), UnitPresenterSystem (0x23d7c70), ShootTriggerSystem (0x21f49d8)
-void *hook_vision_is_visible(void *visionContext, uint32_t targetId, int32_t extra) {
-    if (!g_ShowPosition.load() || !g_InMatch.load() || !visionContext) {
-        if (orig_vision_is_visible) {
-            return orig_vision_is_visible(visionContext, targetId, extra);
+// Hook 12b: IsInsideSector2 (0x166fed8 - spread / shotgun min-max sector cone check, e.g. Sparkle)
+// Called by ShootTriggerSystem (0x21f4d64)
+bool hook_is_inside_sector2(void *sector, void *targetPos, void *targetSize) {
+    if (!sector || (uintptr_t)sector < 0x10000) {
+        if (orig_is_inside_sector2) return orig_is_inside_sector2(sector, targetPos, targetSize);
+        return false;
+    }
+
+    float origAngle = *(float*)((uintptr_t)sector + 0x18);
+    float origRange = *(float*)((uintptr_t)sector + 0x14);
+
+    bool modified = false;
+    if (g_WideLaser.load()) {
+        // Expand laser detection cone to ~68.8 degrees (1.2 rad, ±34.4 degrees around laser line)
+        if (origAngle < 1.2f) {
+            *(float*)((uintptr_t)sector + 0x18) = 1.2f;
+            modified = true;
         }
-        return nullptr;
+    }
+    if (g_MaxWeaponRange.load()) {
+        if (origRange < 5000.0f) {
+            *(float*)((uintptr_t)sector + 0x14) = 10000.0f;
+            modified = true;
+        }
     }
 
-    void *res = nullptr;
-    if (orig_vision_is_visible) {
-        res = orig_vision_is_visible(visionContext, targetId, extra);
+    bool result = false;
+    if (orig_is_inside_sector2) {
+        result = orig_is_inside_sector2(sector, targetPos, targetSize);
     }
 
-    if (res && *(uint8_t*)res != 0) {
-        return res; // Already visible naturally
+    if (modified) {
+        *(float*)((uintptr_t)sector + 0x18) = origAngle;
+        *(float*)((uintptr_t)sector + 0x14) = origRange;
     }
 
-    return (void*)s_AlwaysVisibleBuffer;
+    return result;
+}
+
+// Hook 12c: IsPolygonInsideSector (0x166f3c0 - polygon bounding sector check called by both single & spread weapons)
+// Called by 0x166f9a8 and 0x166ffdc in ShootTriggerSystem (0x21f4ce8, 0x21f4e24)
+bool hook_is_polygon_inside_sec(void *sector, void *polyVec) {
+    if (!sector || (uintptr_t)sector < 0x10000) {
+        if (orig_is_polygon_inside_sec) return orig_is_polygon_inside_sec(sector, polyVec);
+        return false;
+    }
+
+    float origAngle = *(float*)((uintptr_t)sector + 0x18);
+    float origRange = *(float*)((uintptr_t)sector + 0x14);
+
+    bool modified = false;
+    if (g_WideLaser.load()) {
+        // Expand laser detection cone to ~68.8 degrees (1.2 rad, ±34.4 degrees around laser line)
+        if (origAngle < 1.2f) {
+            *(float*)((uintptr_t)sector + 0x18) = 1.2f;
+            modified = true;
+        }
+    }
+    if (g_MaxWeaponRange.load()) {
+        if (origRange < 5000.0f) {
+            *(float*)((uintptr_t)sector + 0x14) = 10000.0f;
+            modified = true;
+        }
+    }
+
+    bool result = false;
+    if (orig_is_polygon_inside_sec) {
+        result = orig_is_polygon_inside_sec(sector, polyVec);
+    }
+
+    if (modified) {
+        *(float*)((uintptr_t)sector + 0x18) = origAngle;
+        *(float*)((uintptr_t)sector + 0x14) = origRange;
+    }
+
+    return result;
 }
 
 // Hook 9: Real-time Camera Zoom Handler (0x31d0594: Camera::setZoom(void *camera, float zoom))
@@ -667,19 +797,32 @@ void *hack_thread(void *) {
     g_PatchWeaponRange2 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_WEAPON_RANGE_PATCH2), "88 c3 a8 52");
     LOGI("[OK] Max Weapon Range Memory Patches prepared (0x265f564 & 0x265fe38)");
 
-    // 12. Hook IsInsideSector (0x166f8bc - Wide Laser Area & Firing Sector Expansion)
+    // 12. Initialize Show Position Memory Patches (culling bypass in UnitPresenterSystem & MarkersPresenterSystem)
+    g_PatchShowPos1 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH1), "37 00 80 52");
+    g_PatchShowPos2 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH2), "29 00 80 52");
+    g_PatchShowPos3 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH3), "28 00 80 52");
+    LOGI("[OK] Show Position Memory Patches prepared (0x23d7c78, 0x23d8b34, 0x167df34)");
+
+    // 13. Hook Sector Checks for Wide Laser Area & Cross-map firing
+    // a. IsInsideSector (0x166f8bc - single sector cone check)
     uintptr_t addrIsInsideSector = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_IS_INSIDE_SECTOR));
     if (addrIsInsideSector) {
         HOOK(OFFSET_IS_INSIDE_SECTOR, hook_is_inside_sector, orig_is_inside_sector);
         LOGI("[OK] Hooked IsInsideSector at 0x%lx", addrIsInsideSector);
     }
 
-    // 13. Hook VisionMethods::isVisible (0x139d6dc - Show Position on Map)
-    memset(s_AlwaysVisibleBuffer, 1, sizeof(s_AlwaysVisibleBuffer));
-    uintptr_t addrVisionIsVisible = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_VISION_IS_VISIBLE));
-    if (addrVisionIsVisible) {
-        HOOK(OFFSET_VISION_IS_VISIBLE, hook_vision_is_visible, orig_vision_is_visible);
-        LOGI("[OK] Hooked VisionMethods::isVisible at 0x%lx", addrVisionIsVisible);
+    // b. IsInsideSector2 (0x166fed8 - spread / shotgun min-max sector cone check, e.g. Sparkle)
+    uintptr_t addrIsInsideSector2 = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_IS_INSIDE_SECTOR2));
+    if (addrIsInsideSector2) {
+        HOOK(OFFSET_IS_INSIDE_SECTOR2, hook_is_inside_sector2, orig_is_inside_sector2);
+        LOGI("[OK] Hooked IsInsideSector2 at 0x%lx", addrIsInsideSector2);
+    }
+
+    // c. IsPolygonInsideSector (0x166f3c0 - polygon bounding sector check called by all weapons)
+    uintptr_t addrIsPolygonInsideSec = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_IS_POLYGON_INSIDE_SEC));
+    if (addrIsPolygonInsideSec) {
+        HOOK(OFFSET_IS_POLYGON_INSIDE_SEC, hook_is_polygon_inside_sec, orig_is_polygon_inside_sec);
+        LOGI("[OK] Hooked IsPolygonInsideSector at 0x%lx", addrIsPolygonInsideSec);
     }
 
     LOGI("All HUD, Full Bright, Camera Zoom, Max Weapon Range, Wide Laser Area, and Show Position modifications installed successfully!");
@@ -788,7 +931,7 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             break;
         case 6: // Show Position Toggle
             g_ShowPosition.store(boolean);
-            UpdateActiveHeroPositionScan(boolean);
+            ApplyShowPosition(boolean);
             LOGI("Show Position toggled: %s (Reveal all player/bot positions on map)", boolean ? "ENABLED" : "DISABLED");
             break;
         default:
