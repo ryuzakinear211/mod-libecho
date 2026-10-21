@@ -37,6 +37,8 @@ static std::atomic<bool>  g_FullBright{false};
 static std::atomic<bool>  g_CameraZoomOut{false};
 static std::atomic<float> g_ZoomFactor{1.6f}; // Default 1.6x zoom factor
 static std::atomic<bool>  g_MaxWeaponRange{false}; // OFF by default
+static std::atomic<bool>  g_WideLaser{true};       // ON by default (Perluas Area Laser)
+static std::atomic<bool>  g_ShowPosition{false};   // OFF by default (Tampilkan Posisi di Map)
 
 static bool g_HudStatusPanelEnabled = false; // OFF by default
 
@@ -102,6 +104,8 @@ static std::atomic<bool> g_PatchesInitialized{false};
 #define OFFSET_CAMERA_SET_ZOOM      "0x31d0594"
 #define OFFSET_WEAPON_RANGE_PATCH1  "0x265f564"
 #define OFFSET_WEAPON_RANGE_PATCH2  "0x265fe38"
+#define OFFSET_IS_INSIDE_SECTOR     "0x166f8bc"
+#define OFFSET_VISION_IS_VISIBLE    "0x139d6dc"
 
 // Original function pointers
 static void *(*orig_alive_units_setup)(void *instance) = nullptr;
@@ -113,6 +117,10 @@ static void  (*orig_match_finished)(void *instance, void *evt) = nullptr;
 static void  (*orig_leave_match)(void *instance, void *evt) = nullptr;
 static void *(*orig_main_menu)(void *instance) = nullptr;
 static void  (*orig_camera_set_zoom)(void *camera, float zoom) = nullptr;
+static bool  (*orig_is_inside_sector)(void *sector, void *targetPos, float targetRadius) = nullptr;
+static void *(*orig_vision_is_visible)(void *visionContext, uint32_t targetId, int32_t extra) = nullptr;
+
+static uint8_t s_AlwaysVisibleBuffer[256];
 
 // Helper: Safely decode libc++ std::string in ARM64 memory
 static std::string ReadStdString(uintptr_t strPtr) {
@@ -262,6 +270,7 @@ void hook_alive_units_update(void *view, int32_t aliveCount, int32_t teamCount) 
 
 // Forward declarations
 static void UpdateActiveHeroWeaponRange(bool enable);
+static void UpdateActiveHeroPositionScan(bool enable);
 
 // Hook 3: Battle Started event (populates real participant list at match start)
 void hook_battle_started(void *matchData, void *msg) {
@@ -282,6 +291,9 @@ void hook_battle_started(void *matchData, void *msg) {
 
     if (g_MaxWeaponRange.load()) {
         UpdateActiveHeroWeaponRange(true);
+    }
+    if (g_ShowPosition.load()) {
+        UpdateActiveHeroPositionScan(true);
     }
 }
 
@@ -378,14 +390,113 @@ static void UpdateActiveHeroWeaponRange(bool enable) {
     float dist = enable ? 10000.0f : 200.0f;
     *(float*)(heroConfig + 0x240) = dist; // primary weapon flyDistance
     *(float*)(heroConfig + 0x24c) = dist; // maxFlyDistance
-    if (enable) {
-        *(float*)(heroConfig + 0x244) = 0.0f; // pinpoint laser accuracy
-    }
     if (IsSafeMemory((void*)(heroConfig + 0x340), sizeof(float))) {
         *(float*)(heroConfig + 0x340) = dist; // secondary weapon flyDistance
     }
 
     LOGI("[WeaponRange] Real-time active hero config updated: flyDist=%.1fm (HeroConfig=%p)", dist, (void*)heroConfig);
+}
+
+// Safely update active hero scan and wallhack configs for Show Position in-match
+static void UpdateActiveHeroPositionScan(bool enable) {
+    uintptr_t libBase = (uintptr_t)getAbsoluteAddress(targetLibName, 0);
+    if (!libBase) return;
+
+    void *managerSlot = (void*)(libBase + 0x375cc70);
+    if (!IsSafeMemory(managerSlot, sizeof(void*))) return;
+
+    uintptr_t manager = *(uintptr_t*)managerSlot;
+    if (!manager) return;
+
+    void *configSlot = (void*)(manager + 0x1a18);
+    if (!IsSafeMemory(configSlot, sizeof(void*))) return;
+
+    uintptr_t heroConfig = *(uintptr_t*)configSlot;
+    if (!heroConfig) return;
+
+    void *scanSlot = (void*)(heroConfig + 0x110);
+    if (!IsSafeMemory(scanSlot, 32)) return;
+
+    if (enable) {
+        *(float*)(heroConfig + 0x110) = 1000.0f; // wallhack
+        *(float*)(heroConfig + 0x114) = 500.0f;  // scanRadius (500m)
+        *(float*)(heroConfig + 0x118) = 500.0f;  // scanAudibleRadius (500m)
+        *(float*)(heroConfig + 0x128) = 500.0f;  // warningAudibleRadius (500m)
+    } else {
+        *(float*)(heroConfig + 0x110) = 0.0f;    // wallhack disabled
+        *(float*)(heroConfig + 0x114) = 50.0f;   // default scanRadius
+        *(float*)(heroConfig + 0x118) = 50.0f;   // default scanAudibleRadius
+        *(float*)(heroConfig + 0x128) = 50.0f;   // default warningAudibleRadius
+    }
+
+    LOGI("[ShowPosition] Real-time active hero scan config updated: enable=%d (HeroConfig=%p)",
+         enable ? 1 : 0, (void*)heroConfig);
+}
+
+// Hook: IsInsideSector (0x166f8bc: bool IsInsideSector(void *sector, void *targetPos, float targetRadius))
+// Called by ShootTriggerSystem (0x21f4c58) and VisionSystem (0x21ed8fc, 0x21ed914)
+bool hook_is_inside_sector(void *sector, void *targetPos, float targetRadius) {
+    if (!sector || (uintptr_t)sector < 0x10000) {
+        if (orig_is_inside_sector) return orig_is_inside_sector(sector, targetPos, targetRadius);
+        return false;
+    }
+
+    float origAngle = *(float*)((uintptr_t)sector + 0x18);
+    float origRange = *(float*)((uintptr_t)sector + 0x14);
+
+    bool modified = false;
+    if (g_WideLaser.load()) {
+        // Expand laser detection cone to ~48.7 degrees (0.85 rad, or ±24.3 degrees around laser line)
+        if (origAngle < 0.85f) {
+            *(float*)((uintptr_t)sector + 0x18) = 0.85f;
+            modified = true;
+        }
+    }
+    if (g_MaxWeaponRange.load()) {
+        if (origRange < 5000.0f) {
+            *(float*)((uintptr_t)sector + 0x14) = 10000.0f;
+            modified = true;
+        }
+    }
+
+    float effectiveRadius = targetRadius;
+    if (g_WideLaser.load() && effectiveRadius < 1.5f) {
+        effectiveRadius = 1.5f;
+    }
+
+    bool result = false;
+    if (orig_is_inside_sector) {
+        result = orig_is_inside_sector(sector, targetPos, effectiveRadius);
+    }
+
+    if (modified) {
+        *(float*)((uintptr_t)sector + 0x18) = origAngle;
+        *(float*)((uintptr_t)sector + 0x14) = origRange;
+    }
+
+    return result;
+}
+
+// Hook: VisionMethods::isVisible (0x139d6dc: void *isVisible(void *visionContext, uint32_t targetId, int32_t extra))
+// Called by MarkersPresenterSystem (0x167df30), UnitPresenterSystem (0x23d7c70), ShootTriggerSystem (0x21f49d8)
+void *hook_vision_is_visible(void *visionContext, uint32_t targetId, int32_t extra) {
+    if (!g_ShowPosition.load() || !g_InMatch.load() || !visionContext) {
+        if (orig_vision_is_visible) {
+            return orig_vision_is_visible(visionContext, targetId, extra);
+        }
+        return nullptr;
+    }
+
+    void *res = nullptr;
+    if (orig_vision_is_visible) {
+        res = orig_vision_is_visible(visionContext, targetId, extra);
+    }
+
+    if (res && *(uint8_t*)res != 0) {
+        return res; // Already visible naturally
+    }
+
+    return (void*)s_AlwaysVisibleBuffer;
 }
 
 // Hook 9: Real-time Camera Zoom Handler (0x31d0594: Camera::setZoom(void *camera, float zoom))
@@ -416,11 +527,16 @@ void hook_camera_set_zoom(void *camera, float zoom) {
         }
     }
 
-    // Sync active hero weapon range during active match every 60 frames (~1 sec)
-    if (g_InMatch.load() && g_MaxWeaponRange.load()) {
-        static uint32_t s_rangeSyncCounter = 0;
-        if ((++s_rangeSyncCounter % 60) == 0) {
-            UpdateActiveHeroWeaponRange(true);
+    // Sync active hero weapon range & position scan during active match every 60 frames (~1 sec)
+    if (g_InMatch.load()) {
+        static uint32_t s_syncCounter = 0;
+        if ((++s_syncCounter % 60) == 0) {
+            if (g_MaxWeaponRange.load()) {
+                UpdateActiveHeroWeaponRange(true);
+            }
+            if (g_ShowPosition.load()) {
+                UpdateActiveHeroPositionScan(true);
+            }
         }
     }
 }
@@ -551,7 +667,22 @@ void *hack_thread(void *) {
     g_PatchWeaponRange2 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_WEAPON_RANGE_PATCH2), "88 c3 a8 52");
     LOGI("[OK] Max Weapon Range Memory Patches prepared (0x265f564 & 0x265fe38)");
 
-    LOGI("All HUD, Full Bright, Camera Zoom, and Max Weapon Range modifications installed successfully!");
+    // 12. Hook IsInsideSector (0x166f8bc - Wide Laser Area & Firing Sector Expansion)
+    uintptr_t addrIsInsideSector = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_IS_INSIDE_SECTOR));
+    if (addrIsInsideSector) {
+        HOOK(OFFSET_IS_INSIDE_SECTOR, hook_is_inside_sector, orig_is_inside_sector);
+        LOGI("[OK] Hooked IsInsideSector at 0x%lx", addrIsInsideSector);
+    }
+
+    // 13. Hook VisionMethods::isVisible (0x139d6dc - Show Position on Map)
+    memset(s_AlwaysVisibleBuffer, 1, sizeof(s_AlwaysVisibleBuffer));
+    uintptr_t addrVisionIsVisible = getAbsoluteAddress(targetLibName, string2Offset(OFFSET_VISION_IS_VISIBLE));
+    if (addrVisionIsVisible) {
+        HOOK(OFFSET_VISION_IS_VISIBLE, hook_vision_is_visible, orig_vision_is_visible);
+        LOGI("[OK] Hooked VisionMethods::isVisible at 0x%lx", addrVisionIsVisible);
+    }
+
+    LOGI("All HUD, Full Bright, Camera Zoom, Max Weapon Range, Wide Laser Area, and Show Position modifications installed successfully!");
 #else
     LOGW("Target is 64-bit arm64-v8a. Non-arm64 compilation skipped.");
 #endif
@@ -569,8 +700,10 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("1_Toggle_Full Bright"),        // OFF by default
             OBFUSCATE("2_Toggle_Camera Zoom Out"),    // OFF by default
             OBFUSCATE("3_SeekBar_Zoom Level_10_30"),  // 10 = 1.0x, 30 = 3.0x, default 16 (1.6x)
+            OBFUSCATE("6_Toggle_Show Position"),      // OFF by default (Tampilkan Posisi di Map)
             OBFUSCATE("Category_Combat & Weapons"),
             OBFUSCATE("4_Toggle_Max Weapon Range"),   // OFF by default
+            OBFUSCATE("5_Toggle_Wide Laser Area_True"), // ON by default (Perluas Area Laser)
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -648,6 +781,15 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             }
             UpdateActiveHeroWeaponRange(boolean);
             LOGI("Max Weapon Range toggled: %s (Cross-map 10km bullet range)", boolean ? "ENABLED" : "DISABLED");
+            break;
+        case 5: // Wide Laser Area Toggle (ON by default)
+            g_WideLaser.store(boolean);
+            LOGI("Wide Laser Area toggled: %s (Expanded detection cone & target bounding around laser)", boolean ? "ENABLED" : "DISABLED");
+            break;
+        case 6: // Show Position Toggle
+            g_ShowPosition.store(boolean);
+            UpdateActiveHeroPositionScan(boolean);
+            LOGI("Show Position toggled: %s (Reveal all player/bot positions on map)", boolean ? "ENABLED" : "DISABLED");
             break;
         default:
             break;

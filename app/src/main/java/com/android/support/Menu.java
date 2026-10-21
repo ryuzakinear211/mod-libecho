@@ -661,6 +661,12 @@ public class Menu {
                     case 4: // Max Weapon Range toggle
                         logToFile("Max Weapon Range toggled: " + (bool ? "ON" : "OFF"));
                         break;
+                    case 5: // Wide Laser Area toggle
+                        logToFile("Wide Laser Area toggled: " + (bool ? "ON" : "OFF"));
+                        break;
+                    case 6: // Show Position toggle
+                        logToFile("Show Position toggled: " + (bool ? "ON" : "OFF"));
+                        break;
                 }
             }
         });
