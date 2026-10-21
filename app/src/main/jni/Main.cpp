@@ -52,19 +52,21 @@ static float g_VanillaCameraZoom = 1.0f;
 static std::vector<void*> g_VisionConfigs;
 static std::mutex g_VisionMutex;
 
-// Max Weapon Range Memory Patches (mov w8, #0x461c0000 [9984.0f] -> "88 c3 a8 52")
-// 1. 0x265f564: WeaponConfigLoader default flyDistance
-// 2. 0x265fe38: HeroConfigLoader default flyDistance
-static MemoryPatch g_PatchWeaponRange1;
-static MemoryPatch g_PatchWeaponRange2;
-
 // Show Position Memory Patches (culling bypass in UnitPresenterSystem & MarkersPresenterSystem)
-// 1. 0x23d7c78: UnitPresenterSystem model visibility check (mov w23, #1 -> "37 00 80 52")
-// 2. 0x23d8b34: UnitPresenterSystem UI/healthbar visibility check (mov w9, #1 -> "29 00 80 52")
-// 3. 0x167df34: MarkersPresenterSystem map/screen marker check (mov w8, #1 -> "28 00 80 52")
+// 1. 0x23d7c60: UnitPresenterSystem context culling bypass (NOP -> "1f 20 03 d5")
+// 2. 0x23d7c78: UnitPresenterSystem model visibility check (mov w23, #1 -> "37 00 80 52")
+// 3. 0x23d8b3c: UnitPresenterSystem UI/healthbar visibility check (mov w8, #1 -> "28 00 80 52")
+// 4. 0x167df34: MarkersPresenterSystem visibility check (mov w8, #1 -> "28 00 80 52")
+// 5. 0x167df48: MarkersPresenterSystem target filter check (NOP -> "1f 20 03 d5")
+// 6. 0x167df68: MarkersPresenterSystem distance check against radius (NOP -> "1f 20 03 d5")
+// 7. 0x167df80: MarkersPresenterSystem obstacle/wall raycast check (NOP -> "1f 20 03 d5")
 static MemoryPatch g_PatchShowPos1;
 static MemoryPatch g_PatchShowPos2;
 static MemoryPatch g_PatchShowPos3;
+static MemoryPatch g_PatchShowPos4;
+static MemoryPatch g_PatchShowPos5;
+static MemoryPatch g_PatchShowPos6;
+static MemoryPatch g_PatchShowPos7;
 
 // Participant entry cached from MatchData
 struct ParticipantInfo {
@@ -110,14 +112,16 @@ static std::atomic<bool> g_PatchesInitialized{false};
 #define OFFSET_DARKNESS_RENDER      "0x114054c"
 #define OFFSET_DARKNESS_SHADOWS     "0x1142af4"
 #define OFFSET_CAMERA_SET_ZOOM      "0x31d0594"
-#define OFFSET_WEAPON_RANGE_PATCH1  "0x265f564"
-#define OFFSET_WEAPON_RANGE_PATCH2  "0x265fe38"
 #define OFFSET_IS_INSIDE_SECTOR     "0x166f8bc"
 #define OFFSET_IS_INSIDE_SECTOR2    "0x166fed8"
 #define OFFSET_IS_POLYGON_INSIDE_SEC "0x166f3c0"
-#define OFFSET_SHOW_POS_PATCH1      "0x23d7c78"
-#define OFFSET_SHOW_POS_PATCH2      "0x23d8b34"
-#define OFFSET_SHOW_POS_PATCH3      "0x167df34"
+#define OFFSET_SHOW_POS_PATCH1      "0x23d7c60"
+#define OFFSET_SHOW_POS_PATCH2      "0x23d7c78"
+#define OFFSET_SHOW_POS_PATCH3      "0x23d8b3c"
+#define OFFSET_SHOW_POS_PATCH4      "0x167df34"
+#define OFFSET_SHOW_POS_PATCH5      "0x167df48"
+#define OFFSET_SHOW_POS_PATCH6      "0x167df68"
+#define OFFSET_SHOW_POS_PATCH7      "0x167df80"
 
 // Original function pointers
 static void *(*orig_alive_units_setup)(void *instance) = nullptr;
@@ -280,8 +284,6 @@ void hook_alive_units_update(void *view, int32_t aliveCount, int32_t teamCount) 
 }
 
 // Forward declarations
-static void UpdateActiveHeroWeaponRange(bool enable);
-static void UpdateActiveHeroPositionScan(bool enable);
 static void ApplyShowPosition(bool enable);
 
 // Hook 3: Battle Started event (populates real participant list at match start)
@@ -301,9 +303,6 @@ void hook_battle_started(void *matchData, void *msg) {
         ParseMatchRoster(matchData);
     }
 
-    if (g_MaxWeaponRange.load()) {
-        UpdateActiveHeroWeaponRange(true);
-    }
     if (g_ShowPosition.load()) {
         ApplyShowPosition(true);
     }
@@ -366,119 +365,7 @@ void *hook_main_menu(void *instance) {
 
 
 
-// Helper: Verify if an address range is safely readable/writable via pipe syscall (never segfaults)
-static bool IsSafeMemory(const void *addr, size_t len) {
-    if (!addr) return false;
-    uintptr_t p = (uintptr_t)addr;
-    if (p < 0x10000) return false;
-    int fd[2];
-    if (pipe(fd) < 0) return false;
-    bool ok = (write(fd[1], addr, len) == (ssize_t)len);
-    close(fd[0]);
-    close(fd[1]);
-    return ok;
-}
-
-// Safely obtain active local HeroConfig in-match without crashes
-static uintptr_t GetActiveHeroConfigSafe() {
-    uintptr_t libBase = (uintptr_t)getAbsoluteAddress(targetLibName, 0);
-    if (!libBase) return 0;
-
-    // Strategy 1: Read via engine PlayerManager chain (0x3711f70 -> 0x37119c0)
-    uintptr_t* pGlobal = (uintptr_t*)(libBase + 0x3711f70);
-    if (IsSafeMemory(pGlobal, sizeof(uintptr_t))) {
-        uintptr_t globalObj = *pGlobal;
-        if (globalObj && IsSafeMemory((void*)(globalObj + 8), sizeof(uintptr_t))) {
-            uintptr_t arr = *(uintptr_t*)(globalObj + 8);
-            uint32_t* pIdx = (uint32_t*)(libBase + 0x37119c0);
-            if (IsSafeMemory(pIdx, sizeof(uint32_t))) {
-                uint32_t idx = *pIdx;
-                uintptr_t elemSlot = arr + ((uintptr_t)idx << 4);
-                if (IsSafeMemory((void*)elemSlot, sizeof(uintptr_t))) {
-                    uintptr_t elem = *(uintptr_t*)elemSlot;
-                    if (elem && IsSafeMemory((void*)(elem + 0x18), sizeof(uintptr_t))) {
-                        uintptr_t playerMgr = *(uintptr_t*)(elem + 0x18);
-                        if (playerMgr && IsSafeMemory((void*)(playerMgr + 0xa0), sizeof(uintptr_t))) {
-                            uintptr_t heroConfig = *(uintptr_t*)(playerMgr + 0xa0);
-                            if (heroConfig && IsSafeMemory((void*)heroConfig, 0x300)) {
-                                return heroConfig;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Strategy 2: Singleton slot at 0x375cc70 + 0x1a18
-    void *managerSlot = (void*)(libBase + 0x375cc70);
-    if (IsSafeMemory(managerSlot, sizeof(void*))) {
-        uintptr_t manager = *(uintptr_t*)managerSlot;
-        if (manager) {
-            void *configSlot = (void*)(manager + 0x1a18);
-            if (IsSafeMemory(configSlot, sizeof(void*))) {
-                uintptr_t heroConfig = *(uintptr_t*)configSlot;
-                if (heroConfig && IsSafeMemory((void*)heroConfig, 0x300)) {
-                    return heroConfig;
-                }
-            }
-        }
-    }
-
-    return 0;
-}
-
-// Safely update active local player weapon range in-match
-static void UpdateActiveHeroWeaponRange(bool enable) {
-    uintptr_t heroConfig = GetActiveHeroConfigSafe();
-    if (!heroConfig) return;
-
-    void *flyDistSlot = (void*)(heroConfig + 0x240);
-    if (!IsSafeMemory(flyDistSlot, 16)) return;
-
-    float dist = enable ? 10000.0f : 200.0f;
-    *(float*)(heroConfig + 0x240) = dist; // primary weapon flyDistance
-    *(float*)(heroConfig + 0x24c) = dist; // maxFlyDistance
-    if (IsSafeMemory((void*)(heroConfig + 0x340), sizeof(float))) {
-        *(float*)(heroConfig + 0x340) = dist; // secondary weapon flyDistance
-    }
-
-    LOGI("[WeaponRange] Real-time active hero config updated: flyDist=%.1fm (HeroConfig=%p)", dist, (void*)heroConfig);
-}
-
-// Safely update active hero scan and wallhack configs for Show Position in-match
-static void UpdateActiveHeroPositionScan(bool enable) {
-    uintptr_t heroConfig = GetActiveHeroConfigSafe();
-    if (!heroConfig) return;
-
-    void *scanSlot = (void*)(heroConfig + 0x110);
-    if (!IsSafeMemory(scanSlot, 32)) return;
-
-    if (enable) {
-        *(float*)(heroConfig + 0x110) = 1000.0f; // wallhack
-        *(float*)(heroConfig + 0x114) = 500.0f;  // scanRadius (500m)
-        *(float*)(heroConfig + 0x118) = 500.0f;  // scanAudibleRadius (500m)
-        *(float*)(heroConfig + 0x128) = 500.0f;  // warningAudibleRadius (500m)
-    } else {
-        *(float*)(heroConfig + 0x110) = 0.0f;    // wallhack disabled
-        *(float*)(heroConfig + 0x114) = 50.0f;   // default scanRadius
-        *(float*)(heroConfig + 0x118) = 50.0f;   // default scanAudibleRadius
-        *(float*)(heroConfig + 0x128) = 50.0f;   // default warningAudibleRadius
-    }
-
-    // Also update heroConfig + 0x40 (VisionConfig*)
-    if (IsSafeMemory((void*)(heroConfig + 0x40), sizeof(void*))) {
-        uintptr_t visionConfig = *(uintptr_t*)(heroConfig + 0x40);
-        if (visionConfig && IsSafeMemory((void*)(visionConfig + 0x20), sizeof(float))) {
-            *(float*)(visionConfig + 0x20) = (enable || g_FullBright.load()) ? 500.0f : 100.0f;
-        }
-    }
-
-    LOGI("[ShowPosition] Real-time active hero scan config updated: enable=%d (HeroConfig=%p)",
-         enable ? 1 : 0, (void*)heroConfig);
-}
-
-// Apply Show Position memory patches (bypasses unit presenter & markers culling)
+// Apply Show Position memory patches (bypasses unit presenter & markers culling, distance checks, wall occlusion)
 static void ApplyShowPosition(bool enable) {
     if (g_PatchShowPos1.isValid()) {
         if (enable) g_PatchShowPos1.Modify();
@@ -492,6 +379,22 @@ static void ApplyShowPosition(bool enable) {
         if (enable) g_PatchShowPos3.Modify();
         else g_PatchShowPos3.Restore();
     }
+    if (g_PatchShowPos4.isValid()) {
+        if (enable) g_PatchShowPos4.Modify();
+        else g_PatchShowPos4.Restore();
+    }
+    if (g_PatchShowPos5.isValid()) {
+        if (enable) g_PatchShowPos5.Modify();
+        else g_PatchShowPos5.Restore();
+    }
+    if (g_PatchShowPos6.isValid()) {
+        if (enable) g_PatchShowPos6.Modify();
+        else g_PatchShowPos6.Restore();
+    }
+    if (g_PatchShowPos7.isValid()) {
+        if (enable) g_PatchShowPos7.Modify();
+        else g_PatchShowPos7.Restore();
+    }
 
     float targetRadius = (enable || g_FullBright.load()) ? 500.0f : 100.0f;
     {
@@ -503,8 +406,7 @@ static void ApplyShowPosition(bool enable) {
         }
     }
 
-    UpdateActiveHeroPositionScan(enable);
-    LOGI("[ShowPosition] %s (Unit presenter & markers culling bypass)", enable ? "ENABLED" : "DISABLED");
+    LOGI("[ShowPosition] %s (Full-map markers & wallhack patches applied)", enable ? "ENABLED" : "DISABLED");
 }
 
 // Hook 12a: IsInsideSector (0x166f8bc - single sector cone check)
@@ -527,10 +429,11 @@ bool hook_is_inside_sector(void *sector, void *targetPos, float targetRadius) {
         }
     }
     if (g_MaxWeaponRange.load()) {
-        if (origRange < 5000.0f) {
-            *(float*)((uintptr_t)sector + 0x14) = 10000.0f;
-            modified = true;
-        }
+        // Extend trigger range safely by +35% to maximum aimed bullet reach
+        // (within server flight distance validation so ammo reduces and damage registers)
+        float maxAimRange = origRange * 1.35f;
+        *(float*)((uintptr_t)sector + 0x14) = maxAimRange;
+        modified = true;
     }
 
     float effectiveRadius = targetRadius;
@@ -571,10 +474,10 @@ bool hook_is_inside_sector2(void *sector, void *targetPos, void *targetSize) {
         }
     }
     if (g_MaxWeaponRange.load()) {
-        if (origRange < 5000.0f) {
-            *(float*)((uintptr_t)sector + 0x14) = 10000.0f;
-            modified = true;
-        }
+        // Extend trigger range safely by +35% to maximum aimed bullet reach
+        float maxAimRange = origRange * 1.35f;
+        *(float*)((uintptr_t)sector + 0x14) = maxAimRange;
+        modified = true;
     }
 
     bool result = false;
@@ -610,10 +513,10 @@ bool hook_is_polygon_inside_sec(void *sector, void *polyVec) {
         }
     }
     if (g_MaxWeaponRange.load()) {
-        if (origRange < 5000.0f) {
-            *(float*)((uintptr_t)sector + 0x14) = 10000.0f;
-            modified = true;
-        }
+        // Extend trigger range safely by +35% to maximum aimed bullet reach
+        float maxAimRange = origRange * 1.35f;
+        *(float*)((uintptr_t)sector + 0x14) = maxAimRange;
+        modified = true;
     }
 
     bool result = false;
@@ -654,19 +557,6 @@ void hook_camera_set_zoom(void *camera, float zoom) {
         if (curZoom != finalZoom) {
             *(float*)((uintptr_t)camera + 0xcc) = finalZoom;
             *(uint32_t*)((uintptr_t)camera + 0x88) = 3; // dirty flag
-        }
-    }
-
-    // Sync active hero weapon range & position scan during active match every 60 frames (~1 sec)
-    if (g_InMatch.load()) {
-        static uint32_t s_syncCounter = 0;
-        if ((++s_syncCounter % 60) == 0) {
-            if (g_MaxWeaponRange.load()) {
-                UpdateActiveHeroWeaponRange(true);
-            }
-            if (g_ShowPosition.load()) {
-                UpdateActiveHeroPositionScan(true);
-            }
         }
     }
 }
@@ -792,16 +682,22 @@ void *hack_thread(void *) {
         LOGI("[OK] Hooked Camera::setZoom at 0x%lx", addrCameraZoom);
     }
 
-    // 11. Initialize Max Weapon Range Memory Patches (mov w8, #0x461c0000 [9984.0f] -> 88 c3 a8 52)
-    g_PatchWeaponRange1 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_WEAPON_RANGE_PATCH1), "88 c3 a8 52");
-    g_PatchWeaponRange2 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_WEAPON_RANGE_PATCH2), "88 c3 a8 52");
-    LOGI("[OK] Max Weapon Range Memory Patches prepared (0x265f564 & 0x265fe38)");
-
-    // 12. Initialize Show Position Memory Patches (culling bypass in UnitPresenterSystem & MarkersPresenterSystem)
-    g_PatchShowPos1 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH1), "37 00 80 52");
-    g_PatchShowPos2 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH2), "29 00 80 52");
+    // 11. Initialize Show Position Memory Patches (culling, distance & wall bypass in UnitPresenterSystem & MarkersPresenterSystem)
+    // 1) 0x23d7c60: UnitPresenterSystem context culling bypass (NOP: 1f 20 03 d5)
+    g_PatchShowPos1 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH1), "1f 20 03 d5");
+    // 2) 0x23d7c78: UnitPresenterSystem model visibility (mov w23, #1: 37 00 80 52)
+    g_PatchShowPos2 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH2), "37 00 80 52");
+    // 3) 0x23d8b3c: UnitPresenterSystem UI/healthbar visibility (mov w8, #1: 28 00 80 52)
     g_PatchShowPos3 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH3), "28 00 80 52");
-    LOGI("[OK] Show Position Memory Patches prepared (0x23d7c78, 0x23d8b34, 0x167df34)");
+    // 4) 0x167df34: MarkersPresenterSystem visibility check (mov w8, #1: 28 00 80 52)
+    g_PatchShowPos4 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH4), "28 00 80 52");
+    // 5) 0x167df48: MarkersPresenterSystem target filter check (NOP: 1f 20 03 d5)
+    g_PatchShowPos5 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH5), "1f 20 03 d5");
+    // 6) 0x167df68: MarkersPresenterSystem distance check against radius (NOP: 1f 20 03 d5 - full map range)
+    g_PatchShowPos6 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH6), "1f 20 03 d5");
+    // 7) 0x167df80: MarkersPresenterSystem obstacle/wall raycast check (NOP: 1f 20 03 d5 - wallhack)
+    g_PatchShowPos7 = MemoryPatch::createWithHex(targetLibName, string2Offset(OFFSET_SHOW_POS_PATCH7), "1f 20 03 d5");
+    LOGI("[OK] Show Position Memory Patches prepared (7 patches for full-map & wallhack ESP)");
 
     // 13. Hook Sector Checks for Wide Laser Area & Cross-map firing
     // a. IsInsideSector (0x166f8bc - single sector cone check)
@@ -914,16 +810,7 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             break;
         case 4: // Max Weapon Range Toggle
             g_MaxWeaponRange.store(boolean);
-            if (g_PatchWeaponRange1.isValid()) {
-                if (boolean) g_PatchWeaponRange1.Modify();
-                else g_PatchWeaponRange1.Restore();
-            }
-            if (g_PatchWeaponRange2.isValid()) {
-                if (boolean) g_PatchWeaponRange2.Modify();
-                else g_PatchWeaponRange2.Restore();
-            }
-            UpdateActiveHeroWeaponRange(boolean);
-            LOGI("Max Weapon Range toggled: %s (Cross-map 10km bullet range)", boolean ? "ENABLED" : "DISABLED");
+            LOGI("Max Weapon Range toggled: %s (Safe server-validated reach +35%%)", boolean ? "ENABLED" : "DISABLED");
             break;
         case 5: // Wide Laser Area Toggle (ON by default)
             g_WideLaser.store(boolean);
