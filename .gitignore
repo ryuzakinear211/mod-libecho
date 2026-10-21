@@ -25,6 +25,7 @@ obj/
 *.d
 app/src/main/obj/
 app/src/main/jni/obj/
+app/src/main/libs/
 
 # Local configuration file (sdk path, etc)
 local.properties
